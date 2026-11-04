@@ -31,6 +31,12 @@ GRIDS = {
         "placement": ["none", "sepgc", "wcount", "sepbit"],
         "op": [0.07, 0.14, 0.28],
     },
+    # Real traces (use with --traces): placement schemes incl. the oracle bound
+    "trace": {
+        "gc": ["greedy", "cost-benefit"],
+        "placement": ["none", "sepgc", "wcount", "sepbit", "oracle"],
+        "op": [0.07, 0.14, 0.28],
+    },
     # Q4: wear leveling. hot-access 1.0 = the cold 80% is never rewritten,
     # the worst case for erase-count spread.
     "wear": {
@@ -61,12 +67,20 @@ def main():
     ap.add_argument("--warmup", type=float, default=3)
     ap.add_argument("--writes", type=float, default=5)
     ap.add_argument("--jobs", type=int, default=os.cpu_count())
+    ap.add_argument("--traces", nargs="+",
+                    help="unified trace files; adds a trace axis, sizes the device to "
+                         "each trace and replays it twice (first pass = warmup)")
     a = ap.parse_args()
 
-    grid = GRIDS[a.grid]
+    grid = dict(GRIDS[a.grid])
+    common = {"blocks": a.blocks, "ppb": a.ppb, "warmup": a.warmup, "writes": a.writes}
+    if a.traces:
+        grid.pop("workload", None)
+        grid = {"trace": a.traces, **grid}
+        common = {"ppb": a.ppb, "size-to-trace": 1, "trace-loops": 2,
+                  "trace-warmup-loops": 1}
     keys = list(grid)
     combos = [dict(zip(keys, vals)) for vals in itertools.product(*grid.values())]
-    common = {"blocks": a.blocks, "ppb": a.ppb, "warmup": a.warmup, "writes": a.writes}
 
     with ThreadPoolExecutor(a.jobs) as pool:
         rows = list(pool.map(lambda p: run_one(p, common), combos))

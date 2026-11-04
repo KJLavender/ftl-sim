@@ -1,6 +1,13 @@
 build/
 results/
 traces/
+trace/
 __pycache__/
 *.pyc
 scripts/dev/
+
+# planning notes stay local
+PLAN.md
+*-plan.md
+plan.md
+*_plan.md

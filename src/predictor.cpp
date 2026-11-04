@@ -101,10 +101,11 @@ int DecisionTree::depth() const {
 }
 
 MlPlacement::MlPlacement(const std::string& model_path, const std::string& gc_mode) {
-  if (gc_mode != "age" && gc_mode != "sepbit") {
-    throw std::invalid_argument("ml gc mode must be age or sepbit");
+  if (gc_mode != "age" && gc_mode != "sepbit" && gc_mode != "hybrid") {
+    throw std::invalid_argument("ml gc mode must be age, sepbit or hybrid");
   }
-  sepbit_gc_ = gc_mode == "sepbit";
+  hybrid_ = gc_mode == "hybrid";
+  sepbit_gc_ = gc_mode == "sepbit" || hybrid_;
   tree_.load(model_path);
 }
 
@@ -116,6 +117,15 @@ void MlPlacement::init(uint64_t logical_pages) {
 int MlPlacement::host_stream(const HostWrite& w) {
   FeatureExtractor::Features x = fx_.extract(w);
   fx_.update(w);
+  if (hybrid_) {
+    // SepBIT's own test first: a short previous lifetime goes to stream 0.
+    if (w.prev_write_time != kNever &&
+        static_cast<double>(w.now - w.prev_write_time) < sepbit_.ell()) {
+      return 0;
+    }
+    // Everything SepBIT would lump into one class is split by the tree.
+    return std::clamp(tree_.predict(x), 1, kLifetimeClasses - 1);
+  }
   int cls = tree_.predict(x);
   return std::clamp(cls, 0, kLifetimeClasses - 1);
 }

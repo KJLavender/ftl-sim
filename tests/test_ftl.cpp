@@ -263,7 +263,7 @@ void test_ml_placement() {
   CHECK(tree.predict(x) == 0);
   CHECK(tree.depth() == 1);
 
-  for (const char* gc : {"age", "sepbit"}) {
+  for (const char* gc : {"age", "sepbit", "hybrid"}) {
     FtlConfig cfg = small_config("greedy", "ml", 0.14);
     auto placement = std::make_unique<MlPlacement>(path, gc);
     Ftl ftl(cfg, make_victim_policy("greedy"), std::move(placement));

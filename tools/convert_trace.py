@@ -65,6 +65,8 @@ def parse_tencent(f, p):
         yield int(ts) * 1_000_000, op, int(off) * 512, int(size) * 512
 
 
+REGION = 1 << 20  # --compact granularity
+
 PARSERS = {"msr": parse_msr, "alibaba": parse_alibaba, "tencent": parse_tencent}
 
 
@@ -78,7 +80,13 @@ def main():
     ap.add_argument("--writes-only", action="store_true")
     ap.add_argument("--rebase", action="store_true",
                     help="shift offsets so the smallest one becomes 0 (two passes)")
+    ap.add_argument("--compact", action="store_true",
+                    help="renumber 1 MiB regions densely in first-touch order, so the "
+                         "device can be sized to the touched footprint instead of the "
+                         "volume's full address span; locality inside a region is kept")
     a = ap.parse_args()
+    if a.rebase and a.compact:
+        ap.error("--rebase and --compact are mutually exclusive")
     if a.rebase and a.input == "-":
         ap.error("--rebase needs a file input (it reads the trace twice)")
 
@@ -97,15 +105,30 @@ def main():
     if a.rebase:
         base = min((r[2] for r in records()), default=0)
 
+    region_map = {}
+
+    def pieces(off, size):
+        """Splits a request at region boundaries and remaps each piece."""
+        if not a.compact:
+            yield off - base, size
+            return
+        end = off + size
+        while off < end:
+            region, inner = divmod(off, REGION)
+            chunk = min(end, (region + 1) * REGION) - off
+            new = region_map.setdefault(region, len(region_map))
+            yield new * REGION + inner, chunk
+            off += chunk
+
     out = sys.stdout if a.output == "-" else open(a.output, "w", encoding="utf-8", newline="\n")
     n, max_end, t0 = 0, 0, None
     stats = {"R": 0, "W": 0, "T": 0}
     for ts, op, off, size in records():
         t0 = ts if t0 is None else t0
-        off -= base
-        out.write(f"{ts - t0},{op},{off},{size}\n")
+        for poff, psize in pieces(off, size):
+            out.write(f"{ts - t0},{op},{poff},{psize}\n")
+            max_end = max(max_end, poff + psize)
         stats[op] += 1
-        max_end = max(max_end, off + size)
         n += 1
     if out is not sys.stdout:
         out.close()

@@ -25,7 +25,8 @@ ftl
   --gc=NAME             greedy | cost-benefit | fifo (default greedy)
   --placement=NAME      none | sepgc | wcount | sepbit | oracle | fdp | ml (default none)
   --model=PATH          ml: decision tree from scripts/train_predictor.py
-  --ml-gc=NAME          ml: GC regrouping, age | sepbit (default age)
+  --ml-gc=NAME          ml: age | sepbit (GC regrouping) | hybrid (SepBIT host test,
+                        tree splits the rest, SepBIT GC) (default age)
   --dump-features=PATH  write predictor training rows (features + true class)
   --dump-sample=F       fraction of host writes to dump (default 0.1)
   --hint-noise=F        fdp: probability a host hint is wrong (default 0)

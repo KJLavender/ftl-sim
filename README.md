@@ -2,182 +2,125 @@
 
 **English** | [繁體中文](README.zh-TW.md)
 
-A trace-driven SSD Flash Translation Layer simulator written from scratch in C++17.
-It measures how GC policy, over-provisioning, data placement (hot/cold separation)
-and wear leveling affect write amplification (WAF). The end goal is to compare
-rule-based placement (SepBIT) with a firmware-sized ML lifetime predictor.
-See [01-ftl-simulator-plan.md](01-ftl-simulator-plan.md) for the full plan.
+An SSD can't overwrite data in place. To update a page it writes the new copy
+somewhere else, and later it has to clean up: pick a block, copy the pages that
+are still valid to a new place, and erase the block. Those extra copies are
+called write amplification. The part of the SSD firmware that does all this is
+the FTL (Flash Translation Layer).
 
-## Features
+ftlsim is a small FTL written from scratch in C++. You feed it a list of disk
+writes (made up, or recorded from real servers), and it tells you how much
+extra writing the drive had to do. I use it to compare cleanup strategies, and
+to test whether a small machine-learning model can sort hot and cold data
+better than a hand-written rule.
 
-| Area | Implemented |
-|---|---|
-| NAND model | page program / block erase, no in-place update, per-block erase count, OOB LPN |
-| Mapping | page-level L2P |
-| GC victim | `greedy`, `cost-benefit`, `fifo` |
-| Placement | `none`, `sepgc` (GC writes in their own stream), `wcount` (write-count rule), `sepbit` (FAST'22), `oracle` (true lifetimes), `fdp` (host hints, noisy / coarse, persistent / initial isolation), `ml` (decision-tree lifetime predictor) |
-| Wear leveling | dynamic (`--wear-aware`: allocate least-erased free block); static (`--static-wl=N`: relocate cold data to the most-worn free block when the erase-count spread exceeds N) |
-| Learned placement | online features with 2 B/LPN state, decision tree trained offline (`scripts/train_predictor.py`), loaded as a ~1 KB node table |
-| Host ops | write, read, TRIM |
-| Workloads | `seq`, `uniform`, `hotcold` (80/20), `zipf`, real traces (MSR / Alibaba / Tencent) |
-| Correctness | shadow map on every read + full L2P/OOB invariant checks |
+## A few terms
 
-## Build and test
+- **WAF** (write amplification factor): data written to flash ÷ data the computer asked to write. 1.0 is perfect; 2.0 means every write cost two.
+- **GC** (garbage collection): the cleanup step above. `greedy` cleans the block with the fewest valid pages. `cost-benefit` also prefers blocks whose data is old.
+- **OP** (over-provisioning): spare space the user can't see. More spare space means GC finds emptier blocks, so WAF drops.
+- **Hot/cold separation**: data that gets rewritten soon (hot) and data that sits for a long time (cold) are written into different blocks. Then a block tends to empty out all at once, and GC has less to copy.
 
-Requires `g++` (C++17) and `make`; developed on WSL2 Ubuntu.
+## What it can do
+
+- Page-level mapping, TRIM, three GC policies (`greedy`, `cost-benefit`, `fifo`).
+- Data placement (where each write goes): no separation, write-count rule, [SepBIT](https://www.usenix.org/conference/fast22/presentation/wang) (a published rule-based method used in production at Alibaba), an "oracle" that knows the future (upper bound), NVMe FDP host hints, and a decision-tree predictor.
+- Wear leveling (keeping erase counts even across blocks): dynamic and static.
+- Synthetic workloads (sequential, uniform random, 80/20, Zipf) and real block traces (MSR Cambridge, Alibaba, Tencent).
+- A shadow copy that checks every read returns the latest data, so a bug can't hide behind plausible numbers.
+
+## Build and run
+
+Needs `g++` (C++17) and `make`. I develop on WSL2 Ubuntu.
 
 ```bash
-make            # build/ftlsim and build/test_ftl
-make test       # unit + theory tests
-bash scripts/smoke_trace.sh   # end-to-end trace path with --verify
-```
-
-## Usage
-
-```bash
-./build/ftlsim --workload=zipf --gc=cost-benefit --placement=sepbit --op=0.14
+make            # builds build/ftlsim and build/test_ftl
+make test       # correctness tests
+./build/ftlsim --workload=zipf --gc=greedy --placement=sepbit --op=0.14
 ./build/ftlsim --help
 ```
 
-Output is a single JSON object (WAF, GC count, valid pages per victim, erase-count
-min/max/mean/std, and the analytic FIFO model WAF for comparison).
+The output is one JSON object: WAF, number of GC runs, erase-count spread, and so on.
 
-Run order: sequential fill of the whole device → `--warmup` × capacity writes
-(not measured) → `--writes` × capacity writes (measured). The whole run is
-recorded first and then replayed, so every placement sees the identical
-request stream and `oracle` / `fdp` can look up each page's true lifetime.
-
-### Learned placement
-
-```bash
-bash scripts/ml_pipeline.sh zipf 0.14     # dump features (seed 1) -> train -> evaluate on seed 2
-./build/ftlsim --placement=ml --model=results/ml/zipf.tree --ml-gc=sepbit
-```
-
-Training needs [uv](https://docs.astral.sh/uv/); dependencies are declared inline in the script.
+A run first fills the whole drive once, then writes `--warmup` × capacity
+(not measured), then `--writes` × capacity (measured). The whole run is
+recorded first and replayed, so every placement method sees exactly the same
+writes.
 
 ### Real traces
 
-```bash
-python3 tools/convert_trace.py alibaba io_traces.csv --volume 28 -o vol28.csv
-./build/ftlsim --trace=vol28.csv --size-to-trace --trace-loops=2 --trace-warmup-loops=1
-```
-
-Unified trace format: `timestamp_us,op,offset_bytes,size_bytes` with `op` ∈ {R, W, T}.
-
-### Experiment grids
+Traces from SNIA IOTTA have to be downloaded by hand in a browser (the site
+blocks scripts). Put the MSR Cambridge `.tar` files in `trace/`, then:
 
 ```bash
-python3 scripts/experiment.py --grid op_sweep  --out results/op_sweep.csv
-python3 scripts/experiment.py --grid placement --out results/placement.csv
-python3 scripts/summarize.py results/placement.csv --rows workload,gc,op --cols placement
+bash scripts/prep_msr.sh trace     # unpack and convert 12 volumes
+python3 scripts/experiment.py --grid trace --traces trace/unified/*.csv --out results/msr_grid.csv
 ```
 
-## Validation
+Other formats: `python3 tools/convert_trace.py {msr|alibaba|tencent} <file> -o out.csv`,
+then `./build/ftlsim --trace=out.csv --size-to-trace`.
 
-| Check | Result |
-|---|---|
-| Sequential overwrite, all GC policies | WAF = 1.00000, zero GC copies |
-| Shadow map, 3 GC × 4 placement × 2 wear-leveling settings, Zipf writes | every read returns the latest version |
-| FIFO under uniform random vs. Desnoyers (SYSTOR'12) closed form | error 0.7% / 0.3% / 0.1% at OP 7% / 14% / 28% |
-| Greedy ≤ FIFO on uniform random | yes |
-| Recorded replay vs. streaming driver | identical NAND write counts |
-| Static WL, oracle, FDP and ML placements under the shadow map | every read returns the latest version |
+### Machine-learning predictor
 
-The analytic model is compared against the *effective* OP, which excludes the
-GC free-block watermark and the unfilled part of open blocks.
+```bash
+bash scripts/ml_pipeline.sh zipf 0.14     # synthetic: train on one run, test on another
+bash scripts/ml_traces.sh trace/unified "hm_0 proj_0" "mds_0 ts_0" 0.07   # train on some volumes, test on others
+```
 
-## Early results
+Training runs in Python with scikit-learn through [uv](https://docs.astral.sh/uv/).
+The tree is saved as a plain node table (about 1.2 KB for 123 nodes) that the
+C++ side loads. The features it uses need 2 bytes of memory per logical page.
 
-2048 blocks × 256 pages × 4 KiB (2 GiB physical), 3× warmup + 5× measured writes.
+## Is the simulator right?
 
-**WAF vs OP and GC policy (no separation)**
+- Rewriting the drive sequentially gives WAF exactly 1.00000 with every GC policy.
+- For FIFO cleanup with uniform random writes there's a known formula (Desnoyers, SYSTOR'12). The simulator matches it within 0.1–0.7% at 7%, 14% and 28% OP.
+- The shadow copy check passes in the tests for every GC policy, every placement method, and both kinds of wear leveling.
 
-| Workload | GC | 7% | 10% | 14% | 20% | 28% |
-|---|---|---|---|---|---|---|
-| uniform | greedy | 7.73 | 5.63 | 4.23 | 3.17 | 2.47 |
-| uniform | cost-benefit | 9.17 | 6.43 | 4.68 | 3.39 | 2.58 |
-| zipf 0.99 | greedy | 7.50 | 5.85 | 4.62 | 3.59 | 2.84 |
-| zipf 0.99 | cost-benefit | 5.79 | 4.36 | 3.42 | 2.74 | 2.29 |
+## Results
 
-**WAF by placement (greedy GC, OP 14%)**
+### Real servers (MSR Cambridge, 12 volumes)
 
-| Workload | none | sepgc | wcount | sepbit |
+Average WAF across 12 volumes. Lower is better.
+
+| GC, spare space | no separation | write-count rule | SepBIT | oracle |
 |---|---|---|---|---|
-| uniform | 4.23 | 4.24 | 4.25 | 4.33 |
-| hotcold 80/20 | 4.53 | 4.53 | 4.46 | 4.43 |
-| zipf 0.99 | 4.62 | 4.59 | 4.22 | 3.55 |
+| greedy, 7% | 2.63 | 2.50 | 1.88 | 1.03 |
+| greedy, 14% | 1.54 | 1.47 | 1.27 | 1.00 |
+| cost-benefit, 7% | 1.64 | 1.55 | 1.21 | 1.02 |
 
-Takeaways so far: cost-benefit only pays off when the workload is skewed;
-separation cannot help uniform writes (extra open streams just consume OP);
-SepBIT cuts WAF by 23% on Zipf at OP 14%.
+The oracle gets close to 1.0 on every volume, so on real data there's a lot to
+gain from knowing how long data will live. SepBIT gets a good part of the way;
+counting writes per address helps much less.
 
-**Wear leveling (hot/cold, cold 80% never rewritten, OP 7%, greedy)**
+Then the ML part (greedy, 7%):
 
-| Setting | WAF | max erase | erase std |
-|---|---|---|---|
-| off | 2.15 | 106 | 44.7 |
-| static, spread ≤ 20 | 2.30 | 53 | 4.9 |
-| static, spread ≤ 50 | 2.24 | 80 | 19.2 |
+- Trained on 5 volumes and tested on 7 others it had never seen, the decision tree did worse than SepBIT on 6 of 7 (it edged ahead only on src1_2: 1.74 vs 1.77).
+- Trained on a volume's own data, it beat SepBIT on 2 of 4 (mds_0 1.58 vs 1.60, wdev_0 1.75 vs 1.85).
+- Letting SepBIT decide first and using the tree only to split the rest lands within about 4% of SepBIT, either way.
 
-Static WL costs 7% extra WAF here. Where the relocated cold data goes matters:
-writing it back into the shared host stream raised WAF from 1.16 to 3.68 in a
-unit test; parking it on the most-worn free block keeps it at 1.33.
+So with these features (write count, previous lifetime, nearby activity,
+request size) the tree learns little that SepBIT doesn't already know. The gap
+to the oracle is real, but closing it needs better signals, not a bigger model.
 
-**Lifetime prediction vs. bounds (Zipf 0.99, OP 14%, train seed 1 → test seed 2)**
+### Synthetic workloads
 
-| Placement | WAF |
-|---|---|
-| none | 4.62 |
-| GC age regrouping only (FDP initial, random hints) | 4.07 |
-| ml, decision tree depth 6, ~1.2 KB | 3.78 – 3.97 |
-| sepbit | 3.55 |
-| FDP, perfect host hints, persistent isolation | 1.93 |
-| perfect host classes + GC age regrouping | 1.74 |
-| oracle | 1.56 |
+- Zipf writes, 14% OP: SepBIT cuts WAF from 4.62 to 3.55. On uniform random writes no separation helps; extra open blocks just eat spare space.
+- `cost-benefit` beats `greedy` when writes are skewed and loses when they're uniform.
+- FDP host hints: perfect hints give 1.93. If half the hints are wrong and GC must keep data inside the hinted group, WAF is 5.03, worse than no hints (4.62). If the drive is allowed to regroup data during GC, it drops to 4.14.
+- Static wear leveling on a drive where 80% of the data is never rewritten: erase-count spread (std) goes from 44.7 to 4.9 for 7% more WAF. Where you move the cold data matters: putting it back with hot data raised WAF from 1.16 to 3.68 in a test; parking it on the most-worn free block kept it at 1.33.
 
-On a memoryless synthetic workload the tree does not beat SepBIT: what is
-learnable is each page's write rate, and SepBIT's previous-lifetime test with
-an adaptive threshold already captures most of it. The oracle's 1.56 depends on
-knowing random inter-write gaps that no history-based predictor can see, so it
-is a loose bound here. Real traces, which have temporal and spatial structure,
-are the actual test.
+## Limitations
 
-**FDP host hints (same setup)**
-
-| Hints | Persistent isolation (GC stays in RUH) | Initial isolation (device regroups GC data by age) |
-|---|---|---|
-| perfect | 1.93 | 1.74 |
-| hot vs. cold only | 3.83 | – |
-| 20% wrong | 4.42 | 4.02 |
-| 50% wrong | 5.03 (worse than no separation, 4.62) | 4.14 |
-
-Wrong hints under persistent isolation are worse than no hints at all;
-letting the device regroup GC data recovers most of the loss.
+- Writes smaller than 4 KiB are counted as full-page writes.
+- For real traces only writes are kept, and the address space is squeezed to the part that was actually written (in 1 MiB chunks).
+- No timing model: it measures write amplification, not latency.
 
 ## Layout
 
 ```
-src/
-  nand.{h,cpp}        NAND array: pages, blocks, erase counts, OOB
-  ftl.{h,cpp}         page-mapped FTL: write/read/trim, GC, free pool, invariants
-  gc_policy.{h,cpp}   victim selection: greedy / cost-benefit / fifo
-  placement.{h,cpp}   stream assignment: none / sepgc / wcount / sepbit / oracle / fdp
-  predictor.{h,cpp}   online features, decision tree, ml placement
-  workload.{h,cpp}    synthetic generators + unified trace reader
-  sim.{h,cpp}         record / replay, death times, feature dump, erase stats, FIFO model
-  main.cpp            CLI, JSON output
-tests/test_ftl.cpp    correctness and theory tests
-tools/convert_trace.py  MSR / Alibaba / Tencent -> unified format
-scripts/              experiment grids, summaries, smoke test
+src/        simulator (nand, ftl, gc_policy, placement, predictor, workload, sim, main)
+tests/      correctness tests
+tools/      trace converters
+scripts/    experiment grids, ML training and pipelines
 ```
-
-## Roadmap
-
-- [x] Week 1: NAND model, L2P, shadow map, sequential WAF = 1
-- [x] Week 2: greedy / cost-benefit / FIFO GC, OP sweep, analytic validation, SepBIT, GC-write separation
-- [x] Week 3 (code): trace converters, static wear leveling
-- [ ] Week 3 (data): run MSR / Alibaba / Tencent traces, compare SepBIT trends with the paper
-- [x] Week 4 (synthetic): oracle, FDP hints (noisy / coarse, persistent / initial), ML predictor pipeline
-- [ ] Week 4 (traces): train on volume A, test on volume B; time-of-day feature; online retraining
-- [ ] Week 5: plots, write-up

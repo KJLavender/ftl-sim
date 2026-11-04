@@ -68,10 +68,15 @@ class DecisionTree {
 //             zero noise is the perfect-host counterpart; or
 //   "sepbit": with SepBIT's GC rules, so the comparison with SepBIT isolates
 //             the host-side predictor. ML class 0 plays SepBIT's class 0.
+//   "hybrid": SepBIT GC rules, and SepBIT's host test (previous lifetime < ell
+//             -> stream 0) runs first; the tree only splits what SepBIT
+//             would put in its single long-lived class into streams 1..4.
 class MlPlacement : public Placement {
  public:
   MlPlacement(const std::string& model_path, const std::string& gc_mode);
-  std::string name() const override { return sepbit_gc_ ? "ml-sepbitgc" : "ml"; }
+  std::string name() const override {
+    return hybrid_ ? "ml-hybrid" : sepbit_gc_ ? "ml-sepbitgc" : "ml";
+  }
   int num_streams() const override { return kLifetimeClasses + (sepbit_gc_ ? 4 : 3); }
   void init(uint64_t logical_pages) override;
   int host_stream(const HostWrite& w) override;
@@ -89,6 +94,7 @@ class MlPlacement : public Placement {
   FeatureExtractor fx_;
   SepBitPlacement sepbit_;
   bool sepbit_gc_;
+  bool hybrid_ = false;  // SepBIT host test first, tree splits the rest
   uint64_t capacity_ = 1;
 };
 
