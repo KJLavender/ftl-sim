@@ -13,14 +13,19 @@ namespace ftl {
 // Per-LPN state is 2 bytes (decayed write count + last lifetime bucket);
 // per-region state is 2 bytes per 256 pages. Lifetimes are normalized by
 // user capacity so a model transfers across device sizes.
+// Features 6..8 are extras for testing whether more information helps:
+// hour of day, position on the drive, and wall-clock time since the page was
+// last written. The last one needs 4 more bytes per LPN, so it is only
+// tracked when asked for.
 class FeatureExtractor {
  public:
-  static constexpr int kNumFeatures = 6;
+  static constexpr int kNumFeatures = 9;
+  static constexpr int kWallGapFeature = 8;
   static constexpr int kRegionShift = 8;  // 256 pages = 1 MiB per region
   using Features = std::array<float, kNumFeatures>;
   static const char* feature_name(int i);
 
-  void init(uint64_t logical_pages);
+  void init(uint64_t logical_pages, bool track_wall_time = true);
   // Features of w, computed from state before w. Call update(w) afterwards.
   Features extract(const HostWrite& w) const;
   void update(const HostWrite& w);
@@ -35,31 +40,41 @@ class FeatureExtractor {
   std::vector<uint8_t> count_;        // decayed writes per LPN
   std::vector<uint8_t> last_bucket_;  // previous lifetime bucket, 0 = unknown
   std::vector<uint16_t> region_heat_; // decayed writes per region
+  std::vector<uint32_t> last_time_s_; // wall clock of the last write (optional)
   Time next_decay_ = 0;
 };
 
-// Decision tree exported by scripts/train_predictor.py. Text format:
-//   ftl-tree v1 <num_nodes> <num_features>
+// Model exported by scripts/train_predictor.py. Two text formats:
+//   ftl-tree v1 <num_nodes> <num_features>          one tree, leaves = class
 //   <feature> <threshold> <left> <right> <class>     (one line per node)
+// or a gradient-boosted ensemble whose leaves add up to a log lifetime:
+//   ftl-gbm v1 <num_trees> <num_features> <base>
+//   then per tree: <num_nodes> and node lines with a float leaf value
 // feature = -1 marks a leaf; go left when x[feature] <= threshold.
 class DecisionTree {
  public:
   void load(const std::string& path);
   int predict(const FeatureExtractor::Features& x) const;
-  size_t num_nodes() const { return nodes_.size(); }
+  size_t num_nodes() const;
+  size_t num_trees() const { return trees_.size(); }
   int depth() const;
-  // Packed firmware size: feature (1B) + threshold (4B) + 2 children (2B each)
-  // + class (1B) per node.
-  size_t firmware_bytes() const { return nodes_.size() * 10; }
+  bool uses_feature(int f) const;
+  // Packed firmware size per node: feature (1B) + threshold (4B) + 2 children
+  // (2B each) + class (1B), or a 4B leaf value for the ensemble.
+  size_t firmware_bytes() const { return num_nodes() * (ensemble_ ? 13 : 10); }
 
  private:
   struct Node {
     int feature;
     float threshold;
     int left, right;
-    int value;
+    float value;
   };
-  std::vector<Node> nodes_;
+  using Tree = std::vector<Node>;
+  static float walk(const Tree& t, const FeatureExtractor::Features& x);
+  std::vector<Tree> trees_;
+  bool ensemble_ = false;
+  float base_ = 0.0f;
 };
 
 // Device-side learned placement: host writes go to the predicted lifetime

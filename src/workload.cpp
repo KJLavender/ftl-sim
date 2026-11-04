@@ -97,6 +97,11 @@ bool TraceWorkload::next_raw(Op& op, uint64_t& offset, uint64_t& bytes) {
       continue;
     }
     if (bytes == 0) continue;
+    try {
+      last_time_s_ = static_cast<uint32_t>(std::stoull(ts) / 1000000) + time_offset_s_;
+    } catch (const std::exception&) {
+      last_time_s_ = time_offset_s_;
+    }
     switch (ops.empty() ? '?' : ops[0]) {
       case 'R': case 'r': op = Op::kRead; break;
       case 'W': case 'w': op = Op::kWrite; break;
@@ -116,6 +121,7 @@ bool TraceWorkload::next(IoRequest& req) {
   if (last >= n_) ++wrapped_;
   req.lpn = static_cast<Lpn>(first % n_);
   req.pages = static_cast<uint32_t>(last - first + 1);
+  req.time_s = last_time_s_;
   return true;
 }
 

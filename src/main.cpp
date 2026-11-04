@@ -25,7 +25,7 @@ device
 ftl
   --gc=NAME             greedy | cost-benefit | fifo (default greedy)
   --placement=NAME      none | sepgc | wcount | sepbit | oracle | fdp | ml (default none)
-  --model=PATH          ml: decision tree from scripts/train_predictor.py
+  --model=PATH          ml: decision tree or boosted ensemble from scripts/train_predictor.py
   --ml-gc=NAME          ml: age | sepbit (GC regrouping) | hybrid (SepBIT host test,
                         tree splits the rest, SepBIT GC) (default age)
   --dump-features=PATH  write predictor training rows (features + true class)
@@ -120,6 +120,7 @@ void print_json(const FtlConfig& cfg, const Ftl& ftl, const std::string& workloa
   std::printf("  \"erase_mean\": %.3f,\n", e.mean);
   std::printf("  \"erase_std\": %.3f,\n", e.stddev);
   if (auto* ml = dynamic_cast<const MlPlacement*>(&ftl.placement())) {
+    std::printf("  \"model_trees\": %zu,\n", ml->tree().num_trees());
     std::printf("  \"model_nodes\": %zu,\n", ml->tree().num_nodes());
     std::printf("  \"model_depth\": %d,\n", ml->tree().depth());
     std::printf("  \"model_bytes\": %zu,\n", ml->tree().firmware_bytes());

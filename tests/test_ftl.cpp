@@ -263,6 +263,25 @@ void test_ml_placement() {
   CHECK(tree.predict(x) == 0);
   CHECK(tree.depth() == 1);
 
+  // Two-tree ensemble on the wall-clock gap (feature 8): leaves add up to a
+  // log lifetime, which is bucketed into a class at 7.01 / 9.00 / 11.0 / 13.0.
+  const std::string gbm_path = "build/test_gbm.tree";
+  {
+    std::FILE* f = std::fopen(gbm_path.c_str(), "w");
+    std::fprintf(f, "ftl-gbm v1 2 %d 8.0\n", FeatureExtractor::kNumFeatures);
+    std::fprintf(f, "3\n8 10 1 2 0\n-1 0 -1 -1 -2.0\n-1 0 -1 -1 2.0\n");
+    std::fprintf(f, "1\n-1 0 -1 -1 0.5\n");
+    std::fclose(f);
+  }
+  DecisionTree gbm;
+  gbm.load(gbm_path);
+  CHECK(gbm.num_trees() == 2 && gbm.num_nodes() == 4);
+  CHECK(gbm.uses_feature(8) && !gbm.uses_feature(2));
+  x[8] = 3;   // 8 - 2 + 0.5 = 6.5  -> class 0
+  CHECK(gbm.predict(x) == 0);
+  x[8] = 12;  // 8 + 2 + 0.5 = 10.5 -> class 2
+  CHECK(gbm.predict(x) == 2);
+
   for (const char* gc : {"age", "sepbit", "hybrid"}) {
     FtlConfig cfg = small_config("greedy", "ml", 0.14);
     auto placement = std::make_unique<MlPlacement>(path, gc);

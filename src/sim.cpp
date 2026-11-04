@@ -14,7 +14,7 @@ void apply(Ftl& ftl, const IoRequest& req) {
   for (uint32_t i = 0; i < req.pages; ++i) {
     Lpn lpn = static_cast<Lpn>((static_cast<uint64_t>(req.lpn) + i) % n);
     switch (req.op) {
-      case Op::kWrite: ftl.write(lpn, req.pages); break;
+      case Op::kWrite: ftl.write(lpn, req.pages, req.time_s); break;
       case Op::kRead: ftl.read(lpn); break;
       case Op::kTrim: ftl.trim(lpn); break;
     }
@@ -43,7 +43,7 @@ void fill_sequential(Ftl& ftl) {
 void Recording::add(const IoRequest& req, uint64_t logical_pages) {
   for (uint32_t i = 0; i < req.pages; ++i) {
     Lpn lpn = static_cast<Lpn>((static_cast<uint64_t>(req.lpn) + i) % logical_pages);
-    ops.push_back({req.op, lpn, req.pages});
+    ops.push_back({req.op, lpn, req.pages, req.time_s});
     if (req.op == Op::kWrite) ++writes;
   }
 }
@@ -70,12 +70,18 @@ Recording record_trace(const std::string& path, uint64_t logical_pages, uint32_t
     for (Lpn l = 0; l < logical_pages; ++l) rec.add({Op::kWrite, l, 1}, logical_pages);
   }
   rec.measure_from = rec.ops.size();
+  // Each loop starts a whole number of days after the previous one, so time
+  // keeps increasing and the hour of day lines up across loops.
+  constexpr uint32_t kDay = 86400;
+  uint32_t offset = 0;
   for (int loop = 0; loop < loops; ++loop) {
     if (loop == warmup_loops) rec.measure_from = rec.ops.size();
     TraceWorkload tw(path, logical_pages, page_size);
+    tw.set_time_offset(offset);
     IoRequest req;
     while (tw.next(req)) rec.add(req, logical_pages);
     rec.trace_wrapped = tw.wrapped();
+    offset = (tw.last_time_s() / kDay + 1) * kDay;
   }
   if (warmup_loops >= loops) rec.measure_from = rec.ops.size();
   return rec;
@@ -105,7 +111,7 @@ void replay(Ftl& ftl, const Recording& rec, const RunOptions& opt) {
     if (i == rec.measure_from) ftl.reset_stats();
     const PageOp& op = rec.ops[i];
     switch (op.op) {
-      case Op::kWrite: ftl.write(op.lpn, op.req_pages); break;
+      case Op::kWrite: ftl.write(op.lpn, op.req_pages, op.time_s); break;
       case Op::kRead: ftl.read(op.lpn); break;
       case Op::kTrim: ftl.trim(op.lpn); break;
     }
@@ -136,7 +142,7 @@ uint64_t dump_features(const Recording& rec, const DeathTimes& death,
     const PageOp& op = rec.ops[i];
     if (op.op == Op::kTrim) last[op.lpn] = kNever;
     if (op.op != Op::kWrite) continue;
-    HostWrite w{op.lpn, ++t, last[op.lpn], op.req_pages};
+    HostWrite w{op.lpn, ++t, last[op.lpn], op.req_pages, op.time_s};
     auto x = fx.extract(w);
     fx.update(w);
     last[op.lpn] = t;

@@ -18,6 +18,7 @@ struct IoRequest {
   Op op = Op::kWrite;
   Lpn lpn = 0;
   uint32_t pages = 1;
+  uint32_t time_s = 0;  // wall-clock seconds (traces only, 0 otherwise)
 };
 
 class Workload {
@@ -85,6 +86,9 @@ class TraceWorkload : public Workload {
   // One parsed line in bytes, before page conversion.
   bool next_raw(Op& op, uint64_t& offset, uint64_t& bytes);
   uint64_t wrapped() const { return wrapped_; }
+  // Added to every timestamp, so a looped trace keeps moving forward in time.
+  void set_time_offset(uint32_t s) { time_offset_s_ = s; }
+  uint32_t last_time_s() const { return last_time_s_; }
   uint64_t bad_lines() const { return bad_lines_; }
 
  private:
@@ -93,6 +97,8 @@ class TraceWorkload : public Workload {
   uint32_t page_size_;
   uint64_t wrapped_ = 0;
   uint64_t bad_lines_ = 0;
+  uint32_t time_offset_s_ = 0;
+  uint32_t last_time_s_ = 0;
 };
 
 // Highest byte address touched by a unified trace (for sizing the device).

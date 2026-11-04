@@ -43,14 +43,14 @@ uint64_t Ftl::logical_pages_for(const FtlConfig& cfg) {
   return static_cast<uint64_t>(cfg.geo.physical_pages() / (1.0 + cfg.op_ratio));
 }
 
-void Ftl::write(Lpn lpn, uint32_t req_pages) {
+void Ftl::write(Lpn lpn, uint32_t req_pages, uint32_t time_s) {
   if (lpn >= logical_pages_) throw std::out_of_range("write lpn out of range");
   ++now_;
   ++stats_.host_writes;
 
   Ppn old = l2p_[lpn];
   Time prev_time = old == kInvalidPpn ? kNever : nand_.page_data_time(old);
-  int stream = placement_->host_stream({lpn, now_, prev_time, req_pages});
+  int stream = placement_->host_stream({lpn, now_, prev_time, req_pages, time_s});
   // Invalidate first so GC triggered by this write never copies stale data.
   unmap(lpn);
 

@@ -11,15 +11,17 @@ namespace ftl {
 const char* FeatureExtractor::feature_name(int i) {
   static const char* names[kNumFeatures] = {
       "prev_lifetime", "first_write", "write_count",
-      "prev2_lifetime", "region_heat", "req_pages_log2"};
+      "prev2_lifetime", "region_heat", "req_pages_log2",
+      "hour", "lba_frac", "prev_gap_s_log2"};
   return names[i];
 }
 
-void FeatureExtractor::init(uint64_t logical_pages) {
+void FeatureExtractor::init(uint64_t logical_pages, bool track_wall_time) {
   capacity_ = std::max<uint64_t>(1, logical_pages);
   count_.assign(logical_pages, 0);
   last_bucket_.assign(logical_pages, 0);
   region_heat_.assign((logical_pages >> kRegionShift) + 1, 0);
+  last_time_s_.assign(track_wall_time ? logical_pages : 0, 0);
   next_decay_ = capacity_;
 }
 
@@ -38,6 +40,12 @@ FeatureExtractor::Features FeatureExtractor::extract(const HostWrite& w) const {
   f[3] = last_bucket_[w.lpn] ? last_bucket_[w.lpn] - 1.0f : -1.0f;
   f[4] = static_cast<float>(std::log2(1.0 + region_heat_[w.lpn >> kRegionShift]));
   f[5] = static_cast<float>(std::log2(static_cast<double>(std::max(1u, w.req_pages))));
+  f[6] = static_cast<float>((w.time_s / 3600) % 24);
+  f[7] = static_cast<float>(static_cast<double>(w.lpn) / static_cast<double>(capacity_));
+  f[8] = -1.0f;
+  if (!first && !last_time_s_.empty() && w.time_s >= last_time_s_[w.lpn]) {
+    f[8] = static_cast<float>(std::log2(1.0 + (w.time_s - last_time_s_[w.lpn])));
+  }
   return f;
 }
 
@@ -53,6 +61,7 @@ void FeatureExtractor::update(const HostWrite& w) {
   if (count_[w.lpn] < 255) ++count_[w.lpn];
   uint16_t& heat = region_heat_[w.lpn >> kRegionShift];
   if (heat < UINT16_MAX) ++heat;
+  if (!last_time_s_.empty()) last_time_s_[w.lpn] = w.time_s;
   if (w.prev_write_time != kNever) {
     // Store floor(norm log lifetime) + 1 in one byte; 0 means unknown.
     float b = norm_log_lifetime(w.now - w.prev_write_time);
@@ -61,7 +70,8 @@ void FeatureExtractor::update(const HostWrite& w) {
 }
 
 uint64_t FeatureExtractor::state_bytes() const {
-  return count_.size() + last_bucket_.size() + region_heat_.size() * sizeof(uint16_t);
+  return count_.size() + last_bucket_.size() + region_heat_.size() * sizeof(uint16_t) +
+         last_time_s_.size() * sizeof(uint32_t);
 }
 
 void DecisionTree::load(const std::string& path) {
@@ -71,33 +81,78 @@ void DecisionTree::load(const std::string& path) {
   size_t n = 0;
   int nf = 0;
   in >> magic >> version >> n >> nf;
-  if (magic != "ftl-tree" || version != "v1") throw std::runtime_error("bad model header");
-  if (nf != FeatureExtractor::kNumFeatures) {
-    throw std::runtime_error("model feature count does not match extractor");
+  if ((magic != "ftl-tree" && magic != "ftl-gbm") || version != "v1") {
+    throw std::runtime_error("bad model header");
   }
-  nodes_.resize(n);
-  for (auto& nd : nodes_) {
-    if (!(in >> nd.feature >> nd.threshold >> nd.left >> nd.right >> nd.value)) {
-      throw std::runtime_error("truncated model file");
+  if (nf > FeatureExtractor::kNumFeatures) {
+    throw std::runtime_error("model uses more features than the extractor has");
+  }
+  ensemble_ = magic == "ftl-gbm";
+  size_t num_trees = 1;
+  if (ensemble_) {
+    num_trees = n;
+    in >> base_;
+  }
+  trees_.assign(num_trees, {});
+  for (Tree& t : trees_) {
+    if (ensemble_) in >> n;
+    t.resize(n);
+    for (Node& nd : t) {
+      if (!(in >> nd.feature >> nd.threshold >> nd.left >> nd.right >> nd.value)) {
+        throw std::runtime_error("truncated model file");
+      }
+      if (nd.feature >= nf) throw std::runtime_error("bad feature index in model");
     }
+    if (t.empty()) throw std::runtime_error("empty tree in model");
   }
-  if (nodes_.empty()) throw std::runtime_error("empty model");
+  if (trees_.empty()) throw std::runtime_error("empty model");
+}
+
+float DecisionTree::walk(const Tree& t, const FeatureExtractor::Features& x) {
+  int i = 0;
+  while (t[i].feature >= 0) {
+    i = x[t[i].feature] <= t[i].threshold ? t[i].left : t[i].right;
+  }
+  return t[i].value;
 }
 
 int DecisionTree::predict(const FeatureExtractor::Features& x) const {
-  int i = 0;
-  while (nodes_[i].feature >= 0) {
-    i = x[nodes_[i].feature] <= nodes_[i].threshold ? nodes_[i].left : nodes_[i].right;
-  }
-  return nodes_[i].value;
+  if (!ensemble_) return static_cast<int>(walk(trees_[0], x));
+  float sum = base_;
+  for (const Tree& t : trees_) sum += walk(t, x);
+  // Class boundaries C/8, C/2, 2C, 8C in the normalized log lifetime
+  // log2(1 + 1024 * L / C), same as lifetime_class().
+  static const float bounds[] = {7.0112f, 9.0028f, 11.0007f, 13.0002f};
+  int cls = 0;
+  while (cls < 4 && sum >= bounds[cls]) ++cls;
+  return cls;
+}
+
+size_t DecisionTree::num_nodes() const {
+  size_t n = 0;
+  for (const Tree& t : trees_) n += t.size();
+  return n;
 }
 
 int DecisionTree::depth() const {
-  std::function<int(int)> rec = [&](int i) -> int {
-    if (nodes_[i].feature < 0) return 0;
-    return 1 + std::max(rec(nodes_[i].left), rec(nodes_[i].right));
-  };
-  return rec(0);
+  int best = 0;
+  for (const Tree& t : trees_) {
+    std::function<int(int)> rec = [&](int i) -> int {
+      if (t[i].feature < 0) return 0;
+      return 1 + std::max(rec(t[i].left), rec(t[i].right));
+    };
+    best = std::max(best, rec(0));
+  }
+  return best;
+}
+
+bool DecisionTree::uses_feature(int f) const {
+  for (const Tree& t : trees_) {
+    for (const Node& nd : t) {
+      if (nd.feature == f) return true;
+    }
+  }
+  return false;
 }
 
 MlPlacement::MlPlacement(const std::string& model_path, const std::string& gc_mode) {
@@ -111,7 +166,7 @@ MlPlacement::MlPlacement(const std::string& model_path, const std::string& gc_mo
 
 void MlPlacement::init(uint64_t logical_pages) {
   capacity_ = std::max<uint64_t>(1, logical_pages);
-  fx_.init(logical_pages);
+  fx_.init(logical_pages, tree_.uses_feature(FeatureExtractor::kWallGapFeature));
 }
 
 int MlPlacement::host_stream(const HostWrite& w) {

@@ -125,9 +125,21 @@ Then the ML part (greedy, 7%):
 - Trained on a volume's own data, it beat SepBIT on 2 of 4 (mds_0 1.58 vs 1.60, wdev_0 1.75 vs 1.85).
 - Letting SepBIT decide first and using the tree only to split the rest lands within about 4% of SepBIT, either way.
 
-So with these features (write count, previous lifetime, nearby activity,
-request size) the tree learns little that SepBIT doesn't already know. The gap
-to the oracle is real, but closing it needs better signals, not a bigger model.
+To find out why it loses, I ran `bash scripts/ml_compare.sh` (same 5 training
+and 7 test volumes, SepBIT's GC rules for every method):
+
+- More data doesn't help: gradient boosting trained on 1% of the rows already
+  predicts lifetime with R² 0.848; all 5.6 million rows only get it to 0.854.
+- A bigger model helps a little, not enough: going from a 1.3 KB tree to a
+  79 KB gradient-boosted model (100 trees) lowers the average WAF over the 7
+  volumes from 2.02 to 1.90, still behind SepBIT's 1.81.
+- Three extra features (hour of day, position on the drive, seconds since the
+  last write) don't help: R² barely moves and WAF gets slightly worse.
+
+So the limit is information. What the drive can see on its own, SepBIT's simple
+rule already uses well. The gap to the oracle is real, but the missing
+information lives on the host (which file, which application), and a bigger
+model can't make it up.
 
 ### Synthetic workloads
 

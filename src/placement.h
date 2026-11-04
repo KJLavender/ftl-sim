@@ -16,6 +16,7 @@ struct HostWrite {
   Time now;
   Time prev_write_time;  // overwritten version's write time, kNever if none
   uint32_t req_pages;    // size of the host request this page belongs to
+  uint32_t time_s = 0;   // wall-clock seconds from the trace, 0 if unknown
 };
 
 // Decides which write stream (open block) a page goes to. Pages in the same

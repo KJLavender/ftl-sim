@@ -38,7 +38,7 @@ class Ftl {
       std::unique_ptr<Placement> placement);
   explicit Ftl(const FtlConfig& cfg);
 
-  void write(Lpn lpn, uint32_t req_pages = 1);
+  void write(Lpn lpn, uint32_t req_pages = 1, uint32_t time_s = 0);
   void read(Lpn lpn);
   void trim(Lpn lpn);
 

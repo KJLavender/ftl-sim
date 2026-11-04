@@ -32,6 +32,7 @@ struct PageOp {
   Op op;
   Lpn lpn;
   uint32_t req_pages;
+  uint32_t time_s;
 };
 struct Recording {
   std::vector<PageOp> ops;
