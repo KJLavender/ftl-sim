@@ -1,0 +1,6 @@
+build/
+results/
+traces/
+__pycache__/
+*.pyc
+scripts/dev/
