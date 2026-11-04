@@ -22,7 +22,7 @@ GRIDS = {
     "op_sweep": {
         "workload": ["uniform", "hotcold", "zipf"],
         "gc": ["greedy", "cost-benefit", "fifo"],
-        "op": [0.07, 0.10, 0.14, 0.20, 0.28],
+        "op": [0.05, 0.07, 0.10, 0.14, 0.20, 0.28, 0.40],
     },
     # Q3 + Q5: placement schemes on skewed workloads
     "placement": {
@@ -36,6 +36,12 @@ GRIDS = {
         "gc": ["greedy", "cost-benefit"],
         "placement": ["none", "sepgc", "wcount", "sepbit", "oracle"],
         "op": [0.07, 0.14, 0.28],
+    },
+    # Q2 on real traces (use with --traces): where does extra OP stop paying off?
+    "trace_op": {
+        "gc": ["greedy", "cost-benefit"],
+        "placement": ["none", "sepbit"],
+        "op": [0.05, 0.07, 0.10, 0.14, 0.20, 0.28, 0.40],
     },
     # Q4: wear leveling. hot-access 1.0 = the cold 80% is never rewritten,
     # the worst case for erase-count spread.

@@ -6,6 +6,8 @@ SSD 不能直接覆寫舊資料。要更新一個 page，它會把新資料寫�
 
 ftlsim 是我從零用 C++ 寫的小型 FTL。餵給它一串硬碟寫入紀錄（可以是自己產生的，也可以是真實伺服器錄下來的），它會算出 SSD 實際多寫了多少。我用它來比較不同的清理策略，也用來測試小型機器學習模型能不能比手寫規則更會分冷熱資料。
 
+完整的結果整理成一篇文章：[docs/article.zh-TW.md](docs/article.zh-TW.md)。
+
 ## 幾個名詞
 
 - **WAF**（寫入放大倍率）：實際寫進 flash 的量 ÷ 電腦要求寫的量。1.0 最好；2.0 代表每寫一次要付出兩次的代價。
@@ -47,6 +49,13 @@ python3 scripts/experiment.py --grid trace --traces trace/unified/*.csv --out re
 
 其他格式：`python3 tools/convert_trace.py {msr|alibaba|tencent} <檔案> -o out.csv`，再執行 `./build/ftlsim --trace=out.csv --size-to-trace`。
 
+### 圖表
+
+```bash
+bash scripts/figure_data.sh     # 跑出圖表需要的實驗資料
+uv run scripts/plots.py         # 產生 docs/figures/*.png
+```
+
 ### 機器學習預測器
 
 ```bash
@@ -59,8 +68,10 @@ bash scripts/ml_traces.sh trace/unified "hm_0 proj_0" "mds_0 ts_0" 0.07   # 用�
 ## 模擬器算得對嗎？
 
 - 循序覆寫整顆 SSD，每種 GC 策略的 WAF 都剛好是 1.00000。
-- FIFO 清理搭配均勻隨機寫入有已知的公式（Desnoyers，SYSTOR'12）。在 OP 7%、14%、28% 下，模擬結果和公式只差 0.1–0.7%。
+- FIFO 清理搭配均勻隨機寫入有已知的公式（Desnoyers，SYSTOR'12）。OP 從 5% 到 40%，模擬結果和公式都只差 0.1–0.5%。
 - 測試裡每種 GC 策略、每種擺放方式、兩種 wear leveling 都通過影子對照表檢查。
+
+![模擬器 vs. 公式](docs/figures/validation.png)
 
 ## 結果
 
@@ -74,7 +85,17 @@ bash scripts/ml_traces.sh trace/unified "hm_0 proj_0" "mds_0 ts_0" 0.07   # 用�
 | greedy，14% | 1.54 | 1.47 | 1.27 | 1.00 |
 | cost-benefit，7% | 1.64 | 1.55 | 1.21 | 1.02 |
 
+![各 volume 的 WAF](docs/figures/msr_placement.png)
+
 oracle 在每個 volume 都接近 1.0，表示在真實資料上，只要知道資料會活多久，就能省下很多寫入。SepBIT 拿到了其中不少；只算每個位址被寫了幾次的效果就差很多。
+
+### 預留空間要多少才夠？
+
+![WAF 和預留空間的關係](docs/figures/op_msr.png)
+
+預留空間每多 1%，省下的寫入就比前一個 1% 少。greedy GC、不分冷熱時，OP 從 5% 加到 7%，每 1% 讓 WAF 降 0.38；超過 20% 之後，每 1% 只降不到 0.02。大約在 10–14% 開始變平，真實 trace 和合成 workload 都一樣（`python3 scripts/op_knee.py results/msr_op.csv`）。
+
+冷熱分離可以換到預留空間：greedy + SepBIT 在 OP 14% 時是 1.27，和不分冷熱、OP 20% 的 1.27 一樣。等於多還給使用者大約 6% 的容量。
 
 接著是機器學習的部分（greedy，7%）：
 
@@ -89,7 +110,11 @@ oracle 在每個 volume 都接近 1.0，表示在真實資料上，只要知道�
 - Zipf 寫入、OP 14%：SepBIT 把 WAF 從 4.62 降到 3.55。均勻隨機寫入下怎麼分都沒用，多開的寫入點只會吃掉備用空間。
 - 寫入偏斜時 `cost-benefit` 比 `greedy` 好，均勻寫入時反而比較差。
 - FDP 主機提示：提示完全正確時是 1.93。如果一半的提示是錯的，而且 GC 只能在原本的分組內搬資料，WAF 是 5.03，比完全不分（4.62）還差；如果允許 SSD 在 GC 時自己重新分組，可以降到 4.14。
-- 靜態 wear leveling，在 80% 資料永遠不改寫的情況下：抹除次數的標準差從 44.7 降到 4.9，代價是 WAF 多 7%。冷資料搬去哪很重要：在測試裡，把它放回熱資料的 block 會讓 WAF 從 1.16 升到 3.68；改放到抹除次數最高的空 block，只升到 1.33。
+- 80% 資料永遠不改寫時的 wear leveling：
+
+  ![抹除次數分布](docs/figures/erase.png)
+
+  動態 wear leveling 在這裡完全沒用：它只會在空的 block 之間挑，而存放冷資料的 block 永遠不會變空。靜態 wear leveling 會主動把冷資料搬走，抹除次數的標準差從 44.7 降到 4.9，代價是 WAF 多 7%。冷資料搬去哪很重要：在測試裡，把它放回熱資料的 block 會讓 WAF 從 1.16 升到 3.68；改放到抹除次數最高的空 block，只升到 1.33。
 
 ## 限制
 

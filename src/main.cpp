@@ -1,6 +1,7 @@
 // ftlsim: trace-driven SSD FTL simulator. Prints one JSON object to stdout.
 #include <cstdio>
 #include <cstdlib>
+#include <stdexcept>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -29,6 +30,7 @@ ftl
                         tree splits the rest, SepBIT GC) (default age)
   --dump-features=PATH  write predictor training rows (features + true class)
   --dump-sample=F       fraction of host writes to dump (default 0.1)
+  --dump-erase=PATH     write each block's final erase count, one per line
   --hint-noise=F        fdp: probability a host hint is wrong (default 0)
   --hint-mode=NAME      fdp: random | coarse (default random)
   --fdp-gc=NAME         fdp: persistent | initial isolation (default persistent)
@@ -168,6 +170,7 @@ int main(int argc, char** argv) {
     const std::string ml_gc = a.str("ml-gc", "age");
     const std::string dump_path = a.str("dump-features", "");
     const double dump_sample = a.num("dump-sample", 0.1);
+    const std::string erase_path = a.str("dump-erase", "");
 
     RunOptions opt;
     opt.verify_reads = cfg.verify;
@@ -216,6 +219,14 @@ int main(int argc, char** argv) {
     replay(ftl, rec, opt);
     const uint64_t wrapped = rec.trace_wrapped;
     if (cfg.verify) ftl.check_invariants();
+    if (!erase_path.empty()) {
+      std::FILE* f = std::fopen(erase_path.c_str(), "w");
+      if (!f) throw std::runtime_error("cannot write " + erase_path);
+      for (BlockId b = 0; b < ftl.nand().num_blocks(); ++b) {
+        std::fprintf(f, "%u\n", ftl.nand().block(b).erase_count);
+      }
+      std::fclose(f);
+    }
     print_json(cfg, ftl, label, alpha, wrapped);
   } catch (const std::exception& ex) {
     std::fprintf(stderr, "ftlsim: %s\n", ex.what());

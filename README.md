@@ -14,6 +14,8 @@ extra writing the drive had to do. I use it to compare cleanup strategies, and
 to test whether a small machine-learning model can sort hot and cold data
 better than a hand-written rule.
 
+A longer write-up of the results (in Traditional Chinese): [docs/article.zh-TW.md](docs/article.zh-TW.md).
+
 ## A few terms
 
 - **WAF** (write amplification factor): data written to flash ÷ data the computer asked to write. 1.0 is perfect; 2.0 means every write cost two.
@@ -60,6 +62,13 @@ python3 scripts/experiment.py --grid trace --traces trace/unified/*.csv --out re
 Other formats: `python3 tools/convert_trace.py {msr|alibaba|tencent} <file> -o out.csv`,
 then `./build/ftlsim --trace=out.csv --size-to-trace`.
 
+### Figures
+
+```bash
+bash scripts/figure_data.sh     # runs the experiments behind the figures
+uv run scripts/plots.py         # writes docs/figures/*.png
+```
+
 ### Machine-learning predictor
 
 ```bash
@@ -74,8 +83,10 @@ C++ side loads. The features it uses need 2 bytes of memory per logical page.
 ## Is the simulator right?
 
 - Rewriting the drive sequentially gives WAF exactly 1.00000 with every GC policy.
-- For FIFO cleanup with uniform random writes there's a known formula (Desnoyers, SYSTOR'12). The simulator matches it within 0.1–0.7% at 7%, 14% and 28% OP.
+- For FIFO cleanup with uniform random writes there's a known formula (Desnoyers, SYSTOR'12). From 5% to 40% OP the simulator stays within 0.1–0.5% of it.
 - The shadow copy check passes in the tests for every GC policy, every placement method, and both kinds of wear leveling.
+
+![Simulator vs. formula](docs/figures/validation.png)
 
 ## Results
 
@@ -89,9 +100,24 @@ Average WAF across 12 volumes. Lower is better.
 | greedy, 14% | 1.54 | 1.47 | 1.27 | 1.00 |
 | cost-benefit, 7% | 1.64 | 1.55 | 1.21 | 1.02 |
 
+![WAF per volume](docs/figures/msr_placement.png)
+
 The oracle gets close to 1.0 on every volume, so on real data there's a lot to
 gain from knowing how long data will live. SepBIT gets a good part of the way;
 counting writes per address helps much less.
+
+### How much spare space is enough?
+
+![WAF vs. spare space](docs/figures/op_msr.png)
+
+Each extra percent of spare space buys less than the one before. With greedy
+GC and no separation, going from 5% to 7% saves 0.38 WAF per percent; past 20%
+it saves under 0.02. Around 10–14% is where it flattens, both on the real
+traces and on synthetic workloads (`python3 scripts/op_knee.py results/msr_op.csv`).
+
+Hot/cold separation is worth spare space: greedy + SepBIT at 14% (1.27) does as
+well as no separation at 20% (1.27). That is about 6% of the drive's capacity
+handed back to the user.
 
 Then the ML part (greedy, 7%):
 
@@ -108,7 +134,11 @@ to the oracle is real, but closing it needs better signals, not a bigger model.
 - Zipf writes, 14% OP: SepBIT cuts WAF from 4.62 to 3.55. On uniform random writes no separation helps; extra open blocks just eat spare space.
 - `cost-benefit` beats `greedy` when writes are skewed and loses when they're uniform.
 - FDP host hints: perfect hints give 1.93. If half the hints are wrong and GC must keep data inside the hinted group, WAF is 5.03, worse than no hints (4.62). If the drive is allowed to regroup data during GC, it drops to 4.14.
-- Static wear leveling on a drive where 80% of the data is never rewritten: erase-count spread (std) goes from 44.7 to 4.9 for 7% more WAF. Where you move the cold data matters: putting it back with hot data raised WAF from 1.16 to 3.68 in a test; parking it on the most-worn free block kept it at 1.33.
+- Wear leveling on a drive where 80% of the data is never rewritten:
+
+  ![Erase counts](docs/figures/erase.png)
+
+  Dynamic wear leveling does nothing here: it only picks among free blocks, and the blocks holding cold data never become free. Static wear leveling moves the cold data out, so the spread (std) drops from 44.7 to 4.9 for 7% more WAF. Where the cold data goes matters: putting it back with hot data raised WAF from 1.16 to 3.68 in a test; parking it on the most-worn free block kept it at 1.33.
 
 ## Limitations
 
