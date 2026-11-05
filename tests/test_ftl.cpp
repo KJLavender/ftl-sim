@@ -51,7 +51,7 @@ void test_sequential_waf_is_one() {
 
 void test_random_with_shadow_all_configs() {
   for (const char* gc : {"greedy", "cost-benefit", "fifo"}) {
-    for (const char* pl : {"none", "sepgc", "wcount", "sepbit"}) {
+    for (const char* pl : {"none", "sepgc", "wcount", "sepbit", "sepbit4"}) {
       for (bool wear : {false, true}) {
         FtlConfig cfg = small_config(gc, pl, 0.14);
         cfg.wear_aware_alloc = wear;
@@ -281,10 +281,20 @@ void test_ml_placement() {
   CHECK(gbm.predict(x) == 0);
   x[8] = 12;  // 8 + 2 + 0.5 = 10.5 -> class 2
   CHECK(gbm.predict(x) == 2);
+  CHECK(std::abs(gbm.predict_value(x) - 10.5f) < 1e-5f);
 
-  for (const char* gc : {"age", "sepbit", "hybrid"}) {
+  bool rejected = false;
+  try {
+    MlPlacement bad(path, "ell2");  // class-only tree has no lifetime output
+  } catch (const std::invalid_argument&) {
+    rejected = true;
+  }
+  CHECK(rejected);
+
+  for (const char* gc : {"age", "sepbit", "hybrid", "ell2", "ell4"}) {
     FtlConfig cfg = small_config("greedy", "ml", 0.14);
-    auto placement = std::make_unique<MlPlacement>(path, gc);
+    const bool ell = std::string(gc).rfind("ell", 0) == 0;
+    auto placement = std::make_unique<MlPlacement>(ell ? gbm_path : path, gc);
     Ftl ftl(cfg, make_victim_policy("greedy"), std::move(placement));
     fill_sequential(ftl);
     ZipfWorkload wl(ftl.logical_pages(), 0.99, 4);

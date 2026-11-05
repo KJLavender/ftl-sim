@@ -116,10 +116,15 @@ float DecisionTree::walk(const Tree& t, const FeatureExtractor::Features& x) {
   return t[i].value;
 }
 
-int DecisionTree::predict(const FeatureExtractor::Features& x) const {
-  if (!ensemble_) return static_cast<int>(walk(trees_[0], x));
+float DecisionTree::predict_value(const FeatureExtractor::Features& x) const {
   float sum = base_;
   for (const Tree& t : trees_) sum += walk(t, x);
+  return sum;
+}
+
+int DecisionTree::predict(const FeatureExtractor::Features& x) const {
+  if (!ensemble_) return static_cast<int>(walk(trees_[0], x));
+  const float sum = predict_value(x);
   // Class boundaries C/8, C/2, 2C, 8C in the normalized log lifetime
   // log2(1 + 1024 * L / C), same as lifetime_class().
   static const float bounds[] = {7.0112f, 9.0028f, 11.0007f, 13.0002f};
@@ -156,12 +161,17 @@ bool DecisionTree::uses_feature(int f) const {
 }
 
 MlPlacement::MlPlacement(const std::string& model_path, const std::string& gc_mode) {
-  if (gc_mode != "age" && gc_mode != "sepbit" && gc_mode != "hybrid") {
-    throw std::invalid_argument("ml gc mode must be age, sepbit or hybrid");
+  if (gc_mode != "age" && gc_mode != "sepbit" && gc_mode != "hybrid" &&
+      gc_mode != "ell2" && gc_mode != "ell4") {
+    throw std::invalid_argument("ml gc mode must be age, sepbit, hybrid, ell2 or ell4");
   }
   hybrid_ = gc_mode == "hybrid";
-  sepbit_gc_ = gc_mode == "sepbit" || hybrid_;
+  ell_groups_ = gc_mode == "ell2" ? 2 : gc_mode == "ell4" ? 4 : 0;
+  sepbit_gc_ = gc_mode != "age";
   tree_.load(model_path);
+  if (ell_groups_ && !tree_.regression()) {
+    throw std::invalid_argument("ell modes need a lifetime model (train with --raw or gbm)");
+  }
 }
 
 void MlPlacement::init(uint64_t logical_pages) {
@@ -172,6 +182,15 @@ void MlPlacement::init(uint64_t logical_pages) {
 int MlPlacement::host_stream(const HostWrite& w) {
   FeatureExtractor::Features x = fx_.extract(w);
   fx_.update(w);
+  if (ell_groups_) {
+    // Back from log2(1 + 1024 L / C) to host writes, then compare with ell.
+    const double v = tree_.predict_value(x);
+    const double life = (std::exp2(v) - 1.0) * static_cast<double>(capacity_) / 1024.0;
+    const double ell = sepbit_.ell();
+    if (life < ell) return 0;
+    if (ell_groups_ == 2) return 1;
+    return life < 4 * ell ? 1 : life < 16 * ell ? 2 : 3;
+  }
   if (hybrid_) {
     // SepBIT's own test first: a short previous lifetime goes to stream 0.
     if (w.prev_write_time != kNever &&

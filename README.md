@@ -136,10 +136,28 @@ and 7 test volumes, SepBIT's GC rules for every method):
 - Three extra features (hour of day, position on the drive, seconds since the
   last write) don't help: R² barely moves and WAF gets slightly worse.
 
-So the limit is information. What the drive can see on its own, SepBIT's simple
-rule already uses well. The gap to the oracle is real, but the missing
-information lives on the host (which file, which application), and a bigger
-model can't make it up.
+So a bigger model or more features alone doesn't win. The gap to the oracle is
+real, and a large part of the missing information lives on the host (which
+file, which application).
+
+What did help was changing how the prediction is used (`bash scripts/ml_cost.sh`).
+The model used to sort data with fixed boundaries (e.g. "dies within 1/8 of the
+capacity = hot"). Instead, compare the predicted lifetime with SepBIT's moving
+threshold ell (how long recently collected hot blocks lived), and split the
+rest at 4 ell and 16 ell into three more groups:
+
+| Method | mean WAF, 7 volumes | volumes beating SepBIT |
+|---|---|---|
+| SepBIT | 1.81 | |
+| decision tree, fixed boundaries | 2.02 | 1 |
+| SepBIT rule split into 4 groups (control, no model) | 1.75 | 7 |
+| decision tree + ell, 4 groups | 1.72 | 6 |
+
+The same 1.3 KB tree goes from 2.02 to 1.72. But part of that is just having
+more groups: SepBIT's own rule split into the same 4 groups already gets 1.75.
+So roughly 2/3 of the gain comes from more groups and 1/3 from the model.
+Training the model to be slow to call data hot (quantile loss) only helped with
+fixed boundaries (2.02 → 1.89) and made no difference once ell was used.
 
 ### Synthetic workloads
 

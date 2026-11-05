@@ -20,6 +20,12 @@ Models:
   gbm   gradient-boosted trees (sklearn's LightGBM-style HistGradientBoosting),
         regress only; used to check whether a much bigger model helps
 
+Asymmetric cost (--quantile q, regress only): predict the q-th quantile of the
+lifetime instead of the mean. Guessing too short costs q per unit, guessing
+too long costs 1 - q, so q > 0.5 makes the model slow to call data hot. That
+matches the drive: long-lived data in a hot block has to be copied by GC,
+short-lived data in a cold block only wastes a page for a while.
+
 Example:
   uv run scripts/train_predictor.py results/ml/zipf_s1.csv -o results/ml/zipf.tree
   uv run scripts/train_predictor.py train.csv -o m.gbm --model gbm \\
@@ -86,6 +92,31 @@ def export_tree(tree, target, path, cols, num_features, split):
                         f"{t.children_left[i]} {t.children_right[i]} {values[i]}\n")
 
 
+def export_raw_tree(tree, leaf_values, path, cols, num_features):
+    """One regression tree in the ensemble format, so leaves hold a lifetime."""
+    t = tree.tree_
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(f"ftl-gbm v1 1 {num_features} 0\n{t.node_count}\n")
+        for i in range(t.node_count):
+            if t.children_left[i] == -1:
+                f.write(f"-1 0 -1 -1 {leaf_values[i]:.9g}\n")
+            else:
+                f.write(f"{cols[t.feature[i]]} {t.threshold[i]:.9g} "
+                        f"{t.children_left[i]} {t.children_right[i]} 0\n")
+
+
+def leaf_quantiles(tree, X, y, q):
+    """Replace each leaf's mean with the q-th quantile of its training rows."""
+    t = tree.tree_
+    values = t.value[:, 0, 0].astype(np.float64).copy()
+    leaves = tree.apply(X)
+    order = np.argsort(leaves, kind="stable")
+    ids, starts = np.unique(leaves[order], return_index=True)
+    for leaf, part in zip(ids, np.split(y[order], starts[1:])):
+        values[leaf] = np.quantile(part, q)
+    return values
+
+
 def gbm_trees(gbm):
     """(base, [node arrays]) of a fitted HistGradientBoostingRegressor."""
     base = float(np.ravel(gbm._baseline_prediction)[0])
@@ -143,6 +174,11 @@ def main():
                     help="'base' (the original six), 'all', or a comma-separated list")
     ap.add_argument("--test", default="",
                     help="CSV(s) from other volumes to score on instead of a random 20%%")
+    ap.add_argument("--quantile", type=float, default=0.0,
+                    help="regress: predict this quantile of the lifetime (0 = mean)")
+    ap.add_argument("--raw", action="store_true",
+                    help="tree, regress: export the predicted lifetime instead of a "
+                         "class (needed for --ml-gc=ell2/ell4)")
     ap.add_argument("--train-frac", type=float, default=1.0,
                     help="train on this random fraction of the training rows")
     ap.add_argument("--seed", type=int, default=0)
@@ -155,6 +191,10 @@ def main():
         ap.error("--split allows at most 4 boundaries")
     if a.model == "gbm" and (a.target != "regress" or split):
         ap.error("--model gbm supports only --target regress without --split")
+    if (a.quantile or a.raw) and a.target != "regress":
+        ap.error("--quantile and --raw need --target regress")
+    if a.raw and split:
+        ap.error("--raw exports a lifetime, --split does not apply")
 
     all_feats, df = load(a.csv)
     if a.features == "base":
@@ -177,9 +217,10 @@ def main():
     ltr, lte = tr["lifetime_log"].to_numpy(), te["lifetime_log"].to_numpy()
 
     if a.model == "gbm":
+        loss = {"loss": "quantile", "quantile": a.quantile} if a.quantile else {}
         model = HistGradientBoostingRegressor(
             max_iter=a.gbm_trees, max_leaf_nodes=a.gbm_leaves, learning_rate=0.1,
-            min_samples_leaf=a.min_leaf, early_stopping=False, random_state=a.seed)
+            min_samples_leaf=a.min_leaf, early_stopping=False, random_state=a.seed, **loss)
         model.fit(Xtr, ltr)
         raw = model.predict(Xte)
         base, trees = gbm_trees(model)
@@ -198,10 +239,18 @@ def main():
     else:
         model = DecisionTreeRegressor(max_depth=a.max_depth, min_samples_leaf=a.min_leaf,
                                       random_state=a.seed).fit(Xtr, ltr)
-        raw = model.predict(Xte)
+        if a.quantile:
+            leaf_values = leaf_quantiles(model, Xtr, ltr, a.quantile)
+            model.tree_.value[:, 0, 0] = leaf_values  # export_tree buckets these
+        else:
+            leaf_values = model.tree_.value[:, 0, 0].copy()
+        raw = leaf_values[model.apply(Xte)]
         pred = to_class(raw)
+    if a.model == "tree" and a.raw:
+        export_raw_tree(model, leaf_values, a.output, cols, len(all_feats))
     if a.model == "tree":
-        export_tree(model, a.target, a.output, cols, len(all_feats), split)
+        if not a.raw:
+            export_tree(model, a.target, a.output, cols, len(all_feats), split)
         n = model.tree_.node_count
         size = f"{n} nodes, depth {model.get_depth()}, ~{n * 10} bytes packed"
 
@@ -214,6 +263,9 @@ def main():
     print(f"accuracy: model {acc:.3f}  prev-lifetime rule {rule:.3f}  majority {majority:.3f}")
     if raw is not None:
         print(f"log-lifetime R^2: model {r2(lte, raw):.3f}")
+        # One unit of log lifetime is a factor of ~2.
+        print(f"guessed >2x too short {np.mean(raw < lte - 1):.3f}  "
+              f">2x too long {np.mean(raw > lte + 1):.3f}")
     print(f"model: {size}")
     if a.model == "tree":
         imp = sorted(zip(model.feature_importances_, names), reverse=True)

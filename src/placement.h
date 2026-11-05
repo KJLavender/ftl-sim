@@ -83,10 +83,14 @@ class WriteCountPlacement : public Placement {
 //   ell (avg lifespan of recently collected class-0 blocks), else class 1.
 //   GC writes: from a class-0 victim -> class 2; otherwise by data age:
 //   < 4*ell -> 3, < 16*ell -> 4, else 5.
+// With host_groups = 4 ("sepbit4", a control for the learned ell4 mode) the
+// long-lived host class is split again by previous lifetime at 4 ell and
+// 16 ell; first writes go to the last host group. GC classes shift up by 2.
 class SepBitPlacement : public Placement {
  public:
-  std::string name() const override { return "sepbit"; }
-  int num_streams() const override { return 6; }
+  explicit SepBitPlacement(int host_groups = 2) : host_groups_(host_groups) {}
+  std::string name() const override { return host_groups_ == 2 ? "sepbit" : "sepbit4"; }
+  int num_streams() const override { return host_groups_ + 4; }
   int host_stream(const HostWrite& w) override;
   int gc_stream(Lpn lpn, Time now, Time data_time, int victim_stream) override;
   void on_victim(int victim_stream, Time open_time, Time now) override;
@@ -95,6 +99,7 @@ class SepBitPlacement : public Placement {
 
  private:
   static constexpr size_t kWindow = 16;  // recent class-0 victims to average
+  int host_groups_;
   double ell_ = 1e300;                   // infinite until first measurement
   std::deque<Time> lifespans_;
   Time lifespan_sum_ = 0;

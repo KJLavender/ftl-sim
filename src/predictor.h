@@ -55,6 +55,9 @@ class DecisionTree {
  public:
   void load(const std::string& path);
   int predict(const FeatureExtractor::Features& x) const;
+  // Ensemble only: the predicted normalized log lifetime itself.
+  float predict_value(const FeatureExtractor::Features& x) const;
+  bool regression() const { return ensemble_; }
   size_t num_nodes() const;
   size_t num_trees() const { return trees_.size(); }
   int depth() const;
@@ -86,10 +89,15 @@ class DecisionTree {
 //   "hybrid": SepBIT GC rules, and SepBIT's host test (previous lifetime < ell
 //             -> stream 0) runs first; the tree only splits what SepBIT
 //             would put in its single long-lived class into streams 1..4.
+//   "ell2":   SepBIT with the predicted lifetime in place of the previous
+//             one: predicted < ell -> stream 0, else stream 1. SepBIT GC.
+//   "ell4":   same, but the rest is split at 4 ell and 16 ell (streams 1..3).
+//             Both need a model that outputs a lifetime (ftl-gbm format).
 class MlPlacement : public Placement {
  public:
   MlPlacement(const std::string& model_path, const std::string& gc_mode);
   std::string name() const override {
+    if (ell_groups_) return ell_groups_ == 2 ? "ml-ell2" : "ml-ell4";
     return hybrid_ ? "ml-hybrid" : sepbit_gc_ ? "ml-sepbitgc" : "ml";
   }
   int num_streams() const override { return kLifetimeClasses + (sepbit_gc_ ? 4 : 3); }
@@ -110,6 +118,7 @@ class MlPlacement : public Placement {
   SepBitPlacement sepbit_;
   bool sepbit_gc_;
   bool hybrid_ = false;  // SepBIT host test first, tree splits the rest
+  int ell_groups_ = 0;   // 2 or 4: compare the predicted lifetime with ell
   uint64_t capacity_ = 1;
 };
 

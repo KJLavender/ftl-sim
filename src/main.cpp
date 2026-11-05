@@ -24,10 +24,12 @@ device
   --op=F                over-provisioning, (phys-user)/user (default 0.07)
 ftl
   --gc=NAME             greedy | cost-benefit | fifo (default greedy)
-  --placement=NAME      none | sepgc | wcount | sepbit | oracle | fdp | ml (default none)
+  --placement=NAME      none | sepgc | wcount | sepbit | sepbit4 | oracle | fdp | ml
+                        (default none; sepbit4 = SepBIT with 4 host groups)
   --model=PATH          ml: decision tree or boosted ensemble from scripts/train_predictor.py
   --ml-gc=NAME          ml: age | sepbit (GC regrouping) | hybrid (SepBIT host test,
-                        tree splits the rest, SepBIT GC) (default age)
+                        tree splits the rest, SepBIT GC) | ell2 | ell4 (predicted
+                        lifetime vs SepBIT's ell, 2 or 4 host groups) (default age)
   --dump-features=PATH  write predictor training rows (features + true class)
   --dump-sample=F       fraction of host writes to dump (default 0.1)
   --dump-erase=PATH     write each block's final erase count, one per line
