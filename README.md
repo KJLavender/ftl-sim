@@ -159,6 +159,13 @@ So roughly 2/3 of the gain comes from more groups and 1/3 from the model.
 Training the model to be slow to call data hot (quantile loss) only helped with
 fixed boundaries (2.02 → 1.89) and made no difference once ell was used.
 
+Two more checks:
+- Training only on the first half of each volume's own trace and measuring on
+  the second half (`bash scripts/ml_online.sh`): 1.58 on average, vs SepBIT
+  1.69 and the 4-group control 1.63; it beats the control on 5 of 7 volumes.
+- At 14% OP the model ties the 4-group control (both 1.21, SepBIT 1.23). With
+  more spare space the model's edge disappears.
+
 ### Synthetic workloads
 
 - Zipf writes, 14% OP: SepBIT cuts WAF from 4.62 to 3.55. On uniform random writes no separation helps; extra open blocks just eat spare space.
