@@ -66,6 +66,7 @@ then `./build/ftlsim --trace=out.csv --size-to-trace`.
 
 ```bash
 bash scripts/figure_data.sh     # runs the experiments behind the figures
+bash scripts/ml_cost.sh && bash scripts/ml_online.sh   # data for ml.png (needs the MSR traces)
 uv run scripts/plots.py         # writes docs/figures/*.png
 ```
 
@@ -162,9 +163,11 @@ fixed boundaries (2.02 → 1.89) and made no difference once ell was used.
 Two more checks:
 - Training only on the first half of each volume's own trace and measuring on
   the second half (`bash scripts/ml_online.sh`): 1.58 on average, vs SepBIT
-  1.69 and the 4-group control 1.63; it beats the control on 5 of 7 volumes.
+  1.68 and the 4-group control 1.63; it beats the control on 5 of 7 volumes.
 - At 14% OP the model ties the 4-group control (both 1.21, SepBIT 1.23). With
   more spare space the model's edge disappears.
+
+![Where the learned placement's gain comes from](docs/figures/ml.png)
 
 ### Synthetic workloads
 

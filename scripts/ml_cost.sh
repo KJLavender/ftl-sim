@@ -68,3 +68,15 @@ awk -F, 'NR > 1 {
     printf "%-10s %-7s %6.3f %d\n", p[1], (p[2] == "sepbit" ? "fixed" : p[2]), sum[k] / n[k], wins
   }
 }' "$csv" | sort -k3 -n | tee "$out/summary.txt"
+
+# Same tree at 14% OP: does the model still add anything over the control?
+run14="--size-to-trace --trace-loops=2 --trace-warmup-loops=1 --op=0.14"
+{
+  printf "%-8s %8s %8s %8s %9s\n" volume none sepbit sepbit4 tree-ell4
+  for v in $test; do
+    w14() { ./build/ftlsim --trace="$dir/$v.csv" $run14 "$@" | grep '"waf"' | tr -dc '0-9.'; }
+    printf "%-8s %8.3f %8.3f %8.3f %9.3f\n" "$v" "$(w14 --placement=none)" \
+      "$(w14 --placement=sepbit)" "$(w14 --placement=sepbit4)" \
+      "$(w14 --placement=ml --model=$out/tree.model --ml-gc=ell4)"
+  done
+} | tee "$out/op14.txt"

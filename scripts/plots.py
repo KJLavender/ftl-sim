@@ -149,8 +149,71 @@ def fig_erase():
     save(fig, "erase.png")
 
 
+def mean_table(name):
+    """Whitespace table (volume + one column per method) -> {method: mean}."""
+    path = os.path.join(RES, name)
+    if not os.path.exists(path):
+        return {}
+    with open(path, encoding="utf-8") as f:
+        lines = [ln.split() for ln in f if ln.strip()]
+    head, body = lines[0][1:], lines[1:]
+    return {h: float(np.mean([float(r[i + 1]) for r in body])) for i, h in enumerate(head)}
+
+
+def fig_ml():
+    """Learned placement vs. SepBIT and the 4-group control, three settings."""
+    cost = rows(os.path.join("ml_cost", "waf.csv"))
+    online = mean_table(os.path.join("ml_online", "waf.txt"))
+    op14 = mean_table(os.path.join("ml_cost", "op14.txt"))
+    if not cost or not online or not op14:
+        return
+    by = defaultdict(list)
+    for x in cost:
+        by[(x["model"], x["mode"])].append(float(x["waf"]))
+    m = {k: float(np.mean(v)) for k, v in by.items()}
+
+    # Colors follow the method, the same in every panel.
+    fixed = ("tree, fixed boundaries", MUTED)
+    sep = ("SepBIT", BLUE)
+    sep4 = ("SepBIT split into 4 groups (no model)", ORANGE)
+    tree = ("tree + ell, 4 groups", AQUA)
+    own = ("tree + ell, trained on own first half", YELLOW)
+    panels = [
+        ("7% spare space, volumes the model never saw",
+         [(fixed, m[("tree", "sepbit")]), (sep, m[("sepbit", "-")]),
+          (sep4, m[("sepbit4", "-")]), (tree, m[("tree", "ell4")])]),
+        ("7% spare space, trained on the first half, measured on the second",
+         [(sep, online["sepbit"]), (sep4, online["sepbit4"]),
+          (("tree + ell, trained on other volumes", AQUA), online["cross-vol"]),
+          (own, online["own-past"])]),
+        ("14% spare space, volumes the model never saw",
+         [(sep, op14["sepbit"]), (sep4, op14["sepbit4"]), (tree, op14["tree-ell4"])]),
+    ]
+    heights = [len(p[1]) + 1.2 for p in panels]
+    fig, axes = plt.subplots(3, 1, figsize=(7.6, 6.6), sharex=True,
+                             gridspec_kw={"height_ratios": heights})
+    for ax, (title, items) in zip(axes, panels):
+        y = np.arange(len(items))[::-1]
+        for yi, ((label, color), v) in zip(y, items):
+            ax.plot([v], [yi], "o", color=color, markersize=10,
+                    markeredgecolor=SURFACE, markeredgewidth=2, zorder=3)
+            ax.annotate(f"{v:.2f}", (v, yi), xytext=(9, 0), textcoords="offset points",
+                        va="center", fontsize=9, color=INK2)
+        ax.set_yticks(y, [lab for (lab, _), _ in items])
+        ax.set_ylim(-0.7, len(items) - 0.3)
+        ax.set_title(title, fontsize=10, color=INK)
+        ax.grid(axis="y", visible=False)
+        ax.tick_params(axis="y", length=0, labelcolor=INK2)
+    axes[-1].set_xlabel("mean WAF over 7 MSR volumes (lower is better)")
+    fig.suptitle("Learned placement: where the gain comes from", x=0.01, ha="left",
+                 fontsize=12, fontweight="bold", color=INK)
+    fig.tight_layout()
+    save(fig, "ml.png")
+
+
 if __name__ == "__main__":
     fig_validation()
     fig_op_msr()
     fig_msr_placement()
     fig_erase()
+    fig_ml()

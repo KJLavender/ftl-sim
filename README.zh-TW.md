@@ -53,6 +53,7 @@ python3 scripts/experiment.py --grid trace --traces trace/unified/*.csv --out re
 
 ```bash
 bash scripts/figure_data.sh     # 跑出圖表需要的實驗資料
+bash scripts/ml_cost.sh && bash scripts/ml_online.sh   # ml.png 的資料（需要 MSR trace）
 uv run scripts/plots.py         # 產生 docs/figures/*.png
 ```
 
@@ -123,8 +124,10 @@ oracle 在每個 volume 都接近 1.0，表示在真實資料上，只要知道�
 同一棵 1.3 KB 的決策樹，WAF 從 2.02 降到 1.72。不過要誠實地扣掉組數變多的功勞：不用模型、只把 SepBIT 切成同樣 4 組就有 1.75。所以進步裡大約 2/3 來自多分組，1/3 來自模型。另外也試了讓模型「不輕易判成熱」的不對稱訓練（quantile loss），只在固定分界時有幫助（2.02 → 1.89），用 ℓ 之後就沒差了。
 
 兩個補充檢查：
-- 只用 volume 自己前半段的資料訓練、在後半段測（`bash scripts/ml_online.sh`）：平均 1.58，SepBIT 1.69，4 組對照組 1.63，7 個裡贏對照組 5 個。
+- 只用 volume 自己前半段的資料訓練、在後半段測（`bash scripts/ml_online.sh`）：平均 1.58，SepBIT 1.68，4 組對照組 1.63，7 個裡贏對照組 5 個。
 - OP 14% 時，模型和 4 組對照組打平（都是 1.21，SepBIT 1.23）。備用空間多時，模型的優勢就不見了。
+
+![模型的進步從哪裡來](docs/figures/ml.png)
 
 ### 合成 workload
 
