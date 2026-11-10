@@ -43,6 +43,8 @@ ftl
   --hint-mode=NAME      fdp: random | coarse (default random)
   --fdp-gc=NAME         fdp: persistent | initial isolation (default persistent)
   --gc-threshold=N      free-block low watermark, 0 = auto
+  --gc-soft=N           paced GC: below watermark + N free blocks, collect one
+                        victim per host write (0 = off)
   --wear-aware          dynamic wear leveling on block allocation
   --static-wl=N         static wear leveling, max erase-count spread (0 = off)
   --static-wl-period=N  check every N GC victims (default 16)
@@ -51,6 +53,9 @@ ftl
   --checkpoint=F        power-loss recovery: save the L2P table every F x capacity
                         host writes; before each save, simulate a crash, rebuild
                         from checkpoint + OOB scan and check it (0 = off)
+  --latency=F           host write latency with foreground GC; writes arrive at
+                        F x the no-GC peak rate (dies / t-prog); 0 = off
+  --dies=N --t-read=US --t-prog=US --t-erase=US   (default 8 / 50 / 600 / 3000)
 workload
   --workload=NAME       seq | uniform | hotcold | zipf (default uniform)
   --trace=PATH          unified CSV trace instead of a synthetic workload
@@ -156,6 +161,17 @@ void print_json(const FtlConfig& cfg, const Ftl& ftl, const std::string& workloa
     std::printf("  \"full_scan_frac\": %.5f,\n",
                 static_cast<double>(ftl.programmed_pages()) / phys);
   }
+  if (const LatencyModel* lat = ftl.latency()) {
+    std::printf("  \"latency_load\": %.3f,\n", cfg.latency.load);
+    std::printf("  \"latency_busy\": %.4f,\n", lat->busy_frac());
+    std::printf("  \"latency_mean_us\": %.1f,\n", lat->mean_us());
+    std::printf("  \"latency_p50_us\": %.1f,\n", lat->percentile_us(50));
+    std::printf("  \"latency_p99_us\": %.1f,\n", lat->percentile_us(99));
+    std::printf("  \"latency_p999_us\": %.1f,\n", lat->percentile_us(99.9));
+    std::printf("  \"latency_max_us\": %.1f,\n", lat->max_us());
+    std::printf("  \"latency_max_gc_copies\": %llu,\n", (unsigned long long)lat->max_copies());
+    std::printf("  \"latency_max_gc_erases\": %llu,\n", (unsigned long long)lat->max_erases());
+  }
   std::printf("  \"fifo_uniform_model_waf\": %.5f,\n", fifo_uniform_waf(alpha));
   std::printf("  \"fifo_uniform_model_waf_effective\": %.5f,\n",
               fifo_uniform_waf(ftl.effective_alpha()));
@@ -189,6 +205,7 @@ int main(int argc, char** argv) {
     cfg.gc_policy = a.str("gc", "greedy");
     cfg.placement = a.str("placement", "none");
     cfg.gc_free_threshold = static_cast<uint32_t>(a.num("gc-threshold", 0));
+    cfg.gc_soft_extra = static_cast<uint32_t>(a.num("gc-soft", 0));
     cfg.wear_aware_alloc = a.num("wear-aware", 0) != 0;
     cfg.static_wl_delta = static_cast<uint32_t>(a.num("static-wl", 0));
     cfg.static_wl_period = static_cast<uint32_t>(a.num("static-wl-period", 16));
@@ -199,6 +216,12 @@ int main(int argc, char** argv) {
     }
     const double checkpoint_frac = a.num("checkpoint", 0);
     if (checkpoint_frac < 0) throw std::invalid_argument("--checkpoint must be >= 0");
+    cfg.latency.load = a.num("latency", 0);
+    cfg.latency.dies = static_cast<uint32_t>(a.num("dies", 8));
+    cfg.latency.t_read_us = a.num("t-read", 50);
+    cfg.latency.t_prog_us = a.num("t-prog", 600);
+    cfg.latency.t_erase_us = a.num("t-erase", 3000);
+    if (cfg.latency.load < 0) throw std::invalid_argument("--latency must be >= 0");
 
     const std::string workload = a.str("workload", "uniform");
     const std::string trace = a.str("trace", "");

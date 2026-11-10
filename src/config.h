@@ -3,6 +3,8 @@
 #include <cstdint>
 #include <string>
 
+#include "latency.h"
+
 namespace ftl {
 
 struct Geometry {
@@ -24,6 +26,9 @@ struct FtlConfig {
   std::string placement = "none";    // none | sepgc | wcount | sepbit | oracle | fdp
   // GC runs when free blocks drop below this. 0 = auto (enough for every stream).
   uint32_t gc_free_threshold = 0;
+  // Paced GC: below threshold + this many free blocks, every host write
+  // first collects one victim, so GC rarely has to catch up in a burst. 0 = off.
+  uint32_t gc_soft_extra = 0;
   // Dynamic wear leveling: allocate the free block with the lowest erase count.
   bool wear_aware_alloc = false;
   // Static wear leveling: when max - min erase count exceeds delta, relocate
@@ -42,6 +47,8 @@ struct FtlConfig {
   // table from the checkpoint plus the OOB of blocks written since, and
   // checks it against the live table.
   uint64_t checkpoint_interval = 0;
+  // Host write latency under foreground GC (latency.load = 0: off).
+  LatencyConfig latency;
 };
 
 }  // namespace ftl

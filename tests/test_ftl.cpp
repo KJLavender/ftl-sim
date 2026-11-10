@@ -465,6 +465,54 @@ void test_power_loss_rebuild() {
   }
 }
 
+// Queue arithmetic, then: GC work shows up as latency.
+void test_latency() {
+  LatencyConfig lc;
+  lc.dies = 1;
+  lc.t_prog_us = 100;
+  lc.t_erase_us = 3000;
+  lc.load = 0.5;  // one arrival every 200 us
+  LatencyModel m(lc);
+  m.on_write(0, 0, 0, 0);  // 100
+  m.on_write(0, 1, 0, 0);  // 3100, leaves 2900 of backlog
+  m.on_write(0, 0, 0, 0);  // 2900 wait + 100
+  CHECK(std::fabs(m.max_us() - 3100) < 1e-3);
+  CHECK(std::fabs(m.percentile_us(0) - 100) < 1e-3);
+  CHECK(std::fabs(m.mean_us() - (100 + 3100 + 3000) / 3.0) < 1e-3);
+
+  // Burst GC vs. paced GC (a few pages per host write) on the same writes.
+  double p99[2];
+  uint64_t max_copies[2];
+  for (int i = 0; i < 2; ++i) {
+    FtlConfig cfg = small_config("greedy", "sepbit", 0.14);
+    cfg.latency.load = 0.1;
+    cfg.gc_soft_extra = i ? 4 : 0;
+    cfg.checkpoint_interval = Ftl::logical_pages_for(cfg) / 4;
+    Ftl ftl(cfg);
+    const uint64_t n = ftl.logical_pages();
+    fill_sequential(ftl);
+    ZipfWorkload wl(n, 0.9, 13);
+    run(ftl, wl, 2 * n);
+    ftl.reset_stats();
+    run(ftl, wl, 2 * n);
+    CHECK(ftl.latency()->count() == ftl.stats().host_writes);
+    // Busy time matches the work the FTL reported.
+    const Stats& s = ftl.stats();
+    const double work = (s.host_writes * 600.0 + s.gc_copies * 650.0 + s.erases * 3000.0) / 8;
+    const double elapsed = s.host_writes * 600.0 / 8 / cfg.latency.load;
+    CHECK(std::fabs(ftl.latency()->busy_frac() - work / elapsed) < 1e-6);
+    ftl.check_invariants();
+    // Paced GC leaves copies with equal tags on flash until the erase.
+    CHECK(ftl.stats().rebuild_mismatches == 0);
+    CHECK(ftl.rebuild_check().mismatches == 0);
+    p99[i] = ftl.latency()->percentile_us(99);
+    max_copies[i] = ftl.latency()->max_copies();
+  }
+  CHECK(max_copies[1] < max_copies[0]);
+  CHECK(max_copies[1] < 64);  // never a whole victim in one write
+  CHECK(p99[1] < p99[0]);
+}
+
 }  // namespace
 
 int main() {
@@ -484,6 +532,7 @@ int main() {
       {"decision tree + ml placement", test_ml_placement},
       {"DRAM-less map cache", test_map_cache},
       {"power-loss L2P rebuild", test_power_loss_rebuild},
+      {"write latency model", test_latency},
   };
   for (auto& t : tests) {
     int before = g_failed;

@@ -21,6 +21,7 @@ ftlsim 是我從零用 C++ 寫的小型 FTL。餵給它一串硬碟寫入紀錄�
 - 資料擺放方式（每筆寫入要放到哪裡）：不分冷熱、依寫入次數、[SepBIT](https://www.usenix.org/conference/fast22/presentation/wang)（已發表、在阿里雲實際上線的規則式方法）、知道未來的「oracle」（理論上限）、NVMe FDP 主機提示，以及決策樹預測器。
 - Wear leveling（讓每個 block 的抹除次數平均）：動態與靜態兩種。
 - DRAM-less 模式：對應表只快取一部分，計算多出來的對應表讀寫。
+- GC 對寫入延遲的影響，可以選 burst 或 paced GC。
 - 斷電復原：用 checkpoint 加上每個 page 的備用區（OOB）重建對應表，再跟真正的表比對。
 - 合成 workload（循序、均勻隨機、80/20、Zipf）和真實的 block trace（MSR Cambridge、Alibaba、Tencent）。
 - 影子對照表：每次讀取都檢查讀到的是不是最新的資料，避免程式有 bug 但數字看起來合理。
@@ -182,6 +183,30 @@ L2P 對應表放在 RAM 裡，突然斷電就沒了，開機時要重建。每�
 
 簡化的地方：斷電一律發生在下次 checkpoint 之前（最糟的時間點）；checkpoint 的寫入有算，但沒有加進 WAF；掃描只算讀幾個 page，沒有時間。
 
+### 寫入延遲：GC 在寫入路徑上跑的時候
+
+WAF 只說了 SSD 多寫了多少，沒說 host 的一筆寫入要等多久。`--latency=F` 加了一個簡單的排隊模型：寫入以固定速率進來（不做 GC 時最高速率的 F 倍；8 個 die，每次 program 600 µs），每筆寫入要等它裡面 GC 做的事做完（每搬一個 page 讀 50 µs + 寫 600 µs，每次抹除 3 ms，平均分給 8 個 die）。沒有寫入快取，也沒有背景 GC，所以這是韌體想辦法要藏起來的最壞情況。
+
+兩種 GC 的跑法：
+- **burst**（模擬器原本的做法）：空的 block 不夠時，碰到門檻的那筆寫入一次回收整個 victim，直到夠了為止。
+- **paced**（`--gc-soft=N`）：空 block 少於門檻 + N 時，每筆 host 寫入都順便搬目前 victim 的幾個 page，速度大約是跟得上所需的兩倍（valid ÷（每個 block 的 page 數 − valid））。
+
+`bash scripts/latency.sh` 在 12 個 MSR volume 上比較兩種（greedy、OP 7%、負載 0.2）。延遲單位是 ms，取 12 個 volume 的中位數。
+
+| 擺放方式 | GC | WAF | 平均 | p99 | p99.9 | 最大 |
+|---|---|---|---|---|---|---|
+| 不分冷熱 | burst | 2.63 | 9.1 | 53.5 | 59.8 | 72.0 |
+| host / GC 分開（`sepgc`） | burst | 2.55 | 7.2 | 41.5 | 57.5 | 63.4 |
+| host / GC 分開（`sepgc`） | paced | 2.60 | 2.7 | 20.2 | 28.6 | 40.3 |
+| SepBIT | burst | 1.88 | 4.2 | 52.9 | 88.4 | 140.3 |
+| SepBIT | paced | 1.91 | 1.5 | 22.7 | 42.2 | 82.1 |
+
+- WAF 低不代表尾端延遲好。burst GC 下，SepBIT 的平均延遲少一半，但 p99.9 和最壞情況反而變差（88 對 60 ms、140 對 72 ms）。用完空 block 的那筆寫入，有時要連續回收很多個 victim：中位數的 volume 上，最慘的一筆寫入要等 1,518 個 page 搬完，不分冷熱是 865 個。SepBIT 有 6 個寫入點，GC 搬的資料本身也一直在用掉空 block。
+- paced GC 用多 1–2% 的 WAF 換掉大部分的問題：SepBIT 的 p99 從 53 降到 23 ms，最壞從 140 降到 82 ms。
+- paced GC 的前提是 GC 搬的資料要有自己的 block。完全不分（所有東西寫進同一個 block）時，pacing 會讓 GC 搬的冷資料和 host 的熱資料交錯寫進同一個 block，WAF 從 2.63 變 4.31，12 個 volume 有 4 個跟不上負載。只要讓 GC 有自己的 block（`sepgc`）就回到 2.60。
+
+簡化的地方：所有 die 合成一個 FIFO 佇列；寫入速率固定，沒有用 trace 的時間；沒有讀取；沒有寫入快取；program 和 erase 不能暫停（suspend/resume）。
+
 ### 合成 workload
 
 - Zipf 寫入、OP 14%：SepBIT 把 WAF 從 4.62 降到 3.55。均勻隨機寫入下怎麼分都沒用，多開的寫入點只會吃掉備用空間。
@@ -197,12 +222,12 @@ L2P 對應表放在 RAM 裡，突然斷電就沒了，開機時要重建。每�
 
 - 小於 4 KiB 的寫入當作整頁寫入。
 - 真實 trace 只保留寫入，而且位址會壓縮到實際寫過的範圍（以 1 MiB 為單位）。
-- 沒有時間模型：只量寫入放大，不量延遲。
+- 延遲模型只是一個固定時間的排隊模型，不是完整的 SSD 時序模型（見上面）。
 
 ## 目錄結構
 
 ```
-src/        模擬器（nand、ftl、gc_policy、placement、predictor、map_cache、workload、sim、main）
+src/        模擬器（nand、ftl、gc_policy、placement、predictor、map_cache、latency、workload、sim、main）
 tests/      正確性測試
 tools/      trace 轉換工具
 scripts/    實驗矩陣、ML 訓練與流程

@@ -61,7 +61,11 @@ class Ftl {
   static uint64_t logical_pages_for(const FtlConfig& cfg);
   Time now() const { return now_; }
   const Stats& stats() const { return stats_; }
-  void reset_stats() { stats_ = Stats{}; }
+  void reset_stats() {
+    stats_ = Stats{};
+    if (lat_) lat_->reset_samples();
+  }
+  const LatencyModel* latency() const { return lat_.get(); }
   const Nand& nand() const { return nand_; }
   const Placement& placement() const { return *placement_; }
   const VictimPolicy& victim_policy() const { return *victim_; }
@@ -96,6 +100,8 @@ class Ftl {
   void ensure_free_space();
   void collect_one();
   void maybe_static_wear_level();
+  // Paced GC: copy a few pages of the current victim per host write.
+  void pace_gc();
   // Moves every valid page out of the block, erases it, returns pages moved.
   // forced_stream >= 0 bypasses the placement policy.
   uint32_t relocate_and_erase(BlockId victim, int forced_stream = -1);
@@ -121,6 +127,10 @@ class Ftl {
   uint32_t gc_since_wl_check_ = 0;
   int wl_stream_ = -1;  // internal stream for static WL, -1 if disabled
   std::unique_ptr<MapCache> map_;  // DRAM-less mapping cache, null = all in DRAM
+  std::unique_ptr<LatencyModel> lat_;  // null = no timing
+  BlockId pace_victim_ = kInvalidBlock;
+  uint32_t pace_pos_ = 0;
+  uint32_t pace_budget_ = 0;
   // Recovery bookkeeping: program counter, last program per block, snapshot.
   uint64_t prog_seq_ = 0;
   std::vector<uint64_t> block_last_prog_;

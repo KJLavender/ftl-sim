@@ -196,6 +196,20 @@ NVMe 有個新功能叫 FDP（Flexible Data Placement）：主機寫入時順便
 - **冷熱分離又省一次**：GC 寫得少，兩次 checkpoint 之間被動到的 block 就少，SepBIT 要掃的少大約四分之一。
 - **TRIM 要另外記**：OOB 只記寫入，被 TRIM 的資料如果還在 flash 上，重建後會復活。單元測試裡重現了這個現象，真正的韌體會把 TRIM 也記下來。
 
+## 結果八：WAF 低，延遲不一定好
+
+WAF 只算寫了多少，沒算 host 要等多久。我加了一個簡單的排隊模型（`--latency`，8 個 die、program 600 µs、erase 3 ms，固定速率寫入，沒有寫入快取），在 12 個 MSR volume 上比較（`scripts/latency.sh`，負載 0.2，延遲取中位數）：
+
+| 擺放方式 | GC | WAF | 平均 | p99.9 | 最大 |
+|---|---|---|---|---|---|
+| 不分冷熱 | burst | 2.63 | 9.1 ms | 60 ms | 72 ms |
+| SepBIT | burst | 1.88 | 4.2 ms | 88 ms | 140 ms |
+| SepBIT | paced | 1.91 | 1.5 ms | 42 ms | 82 ms |
+
+- **平均變好，尾端變差**：SepBIT 的 WAF 低很多，平均延遲也少一半，但最慘的那幾筆反而更慘。原因是 GC 一次回收到夠為止：空 block 用完時，那一筆寫入有時要等十幾個 victim 搬完（最慘 1,518 個 page，不分冷熱 865 個），因為 SepBIT 的 6 個寫入點連 GC 搬資料時都在用空 block。
+- **paced GC**（`--gc-soft`）：提早開始，每筆 host 寫入只順便搬幾個 page。多 1–2% 的 WAF，p99 從 53 降到 23 ms，最壞從 140 降到 82 ms。這就是韌體做 background / incremental GC 的原因。
+- **pacing 要搭配分開的 GC block**：所有東西寫同一個 block 時，GC 搬的冷資料會和 host 的熱資料交錯，WAF 從 2.63 暴增到 4.31。只要讓 GC 有自己的 block 就回到 2.60。冷熱分離在這裡又出現一次。
+
 ## 順便：wear leveling
 
 每個 block 能抹除的次數有限，所以韌體要讓大家平均磨損。我模擬了一個極端情況：80% 的資料寫進去後就再也不動。
@@ -210,7 +224,7 @@ NVMe 有個新功能叫 FDP（Flexible Data Placement）：主機寫入時順便
 
 - 小於 4 KB 的寫入當成整頁寫入。
 - 真實 trace 只保留寫入，位址有壓縮。
-- 沒有時間模型，只量 WAF，不量延遲。
+- 延遲只是一個簡單的排隊模型（die 合成一個佇列、固定速率、沒有讀取和寫入快取）。
 - AI 的部分試了決策樹和 Gradient Boosting，特徵都是 SSD 自己算得出來的；沒有試主機端的資訊。
 - ell4 只比 SepBIT 好 5%，模型本身的貢獻更小（0.037 ± 0.007）；OP 14% 時模型和沒有模型的 4 組對照組打平。
 - 只測了 MSR 這 7 個 volume，統計檢定只有 7 個樣本，p = 0.04 算是勉強過關。

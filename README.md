@@ -29,6 +29,7 @@ A longer write-up of the results (in Traditional Chinese): [docs/article.zh-TW.m
 - Data placement (where each write goes): no separation, write-count rule, [SepBIT](https://www.usenix.org/conference/fast22/presentation/wang) (a published rule-based method used in production at Alibaba), an "oracle" that knows the future (upper bound), NVMe FDP host hints, and a decision-tree predictor.
 - Wear leveling (keeping erase counts even across blocks): dynamic and static.
 - A DRAM-less mode that caches only part of the mapping table and counts the extra map reads and writes.
+- Host write latency under GC, with burst or paced GC.
 - Power-loss recovery: rebuilds the mapping table from checkpoints plus the
   per-page spare area (OOB), and checks the result against the real table.
 - Synthetic workloads (sequential, uniform random, 80/20, Zipf) and real block traces (MSR Cambridge, Alibaba, Tencent).
@@ -284,6 +285,51 @@ Simplifications: the crash is always placed just before a checkpoint (the worst
 moment); checkpoint writes are counted but not added to WAF; scan cost is
 counted in pages read, with no timing.
 
+### Write latency: when GC runs in the write path
+
+WAF tells you how much the drive writes, not how long a host write waits.
+`--latency=F` adds a simple queue: writes arrive at a fixed rate (F times the
+peak rate with no GC, 8 dies at 600 µs per program), and each write has to wait
+for whatever GC did inside it (50 µs read + 600 µs program per copied page,
+3 ms per erase, spread over the 8 dies). There is no write buffer and no
+background GC, so this is the worst case firmware tries to hide.
+
+Two ways to run GC:
+- **burst** (what the simulator did so far): when free blocks run out, the
+  write that hit the limit collects whole victims until there are enough again.
+- **paced** (`--gc-soft=N`): once free blocks drop below the limit + N, every
+  host write copies a few pages of the current victim, about twice the rate
+  needed to keep up (valid / (pages per block − valid)).
+
+`bash scripts/latency.sh` runs both on the 12 MSR volumes (greedy, 7% OP,
+load 0.2). Latency is in ms, the median over volumes.
+
+| placement | GC | WAF | mean | p99 | p99.9 | max |
+|---|---|---|---|---|---|---|
+| no separation | burst | 2.63 | 9.1 | 53.5 | 59.8 | 72.0 |
+| host / GC split (`sepgc`) | burst | 2.55 | 7.2 | 41.5 | 57.5 | 63.4 |
+| host / GC split (`sepgc`) | paced | 2.60 | 2.7 | 20.2 | 28.6 | 40.3 |
+| SepBIT | burst | 1.88 | 4.2 | 52.9 | 88.4 | 140.3 |
+| SepBIT | paced | 1.91 | 1.5 | 22.7 | 42.2 | 82.1 |
+
+- Lower WAF doesn't mean a better tail. With burst GC, SepBIT halves the mean
+  latency but its p99.9 and worst case get worse (88 vs 60 ms, 140 vs 72 ms).
+  The write that runs out of free blocks sometimes has to collect many victims
+  in a row: on the median volume the worst single write waited for 1,518 page
+  copies, against 865 without separation. With six open blocks, the GC copies
+  themselves keep using up free blocks.
+- Paced GC fixes most of that for 1–2% more WAF: SepBIT's p99 drops from 53
+  to 23 ms and the worst case from 140 to 82 ms.
+- Paced GC needs GC copies to go to their own block. With no separation at
+  all (one open block for everything), pacing interleaves cold GC copies with
+  hot host writes in the same block, WAF goes from 2.63 to 4.31, and 4 of 12
+  volumes can't keep up with the load any more. Just giving GC its own block
+  (`sepgc`) brings it back to 2.60.
+
+Simplifications: one FIFO queue with the dies lumped together, fixed arrival
+rate instead of the trace's timing, no read traffic, no write cache, no
+suspend/resume of program and erase.
+
 ### Synthetic workloads
 
 - Zipf writes, 14% OP: SepBIT cuts WAF from 4.62 to 3.55. On uniform random writes no separation helps; extra open blocks just eat spare space.
@@ -299,12 +345,12 @@ counted in pages read, with no timing.
 
 - Writes smaller than 4 KiB are counted as full-page writes.
 - For real traces only writes are kept, and the address space is squeezed to the part that was actually written (in 1 MiB chunks).
-- No timing model: it measures write amplification, not latency.
+- The latency model is a single queue with fixed timings, not a full SSD timing model (see above).
 
 ## Layout
 
 ```
-src/        simulator (nand, ftl, gc_policy, placement, predictor, map_cache, workload, sim, main)
+src/        simulator (nand, ftl, gc_policy, placement, predictor, map_cache, latency, workload, sim, main)
 tests/      correctness tests
 tools/      trace converters
 scripts/    experiment grids, ML training and pipelines

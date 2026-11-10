@@ -24,7 +24,7 @@ Ftl::Ftl(const FtlConfig& cfg, std::unique_ptr<VictimPolicy> victim,
   // Each stream may need a fresh block while one victim is being migrated.
   gc_threshold_ = cfg.gc_free_threshold ? cfg.gc_free_threshold : streams + 2;
   const uint64_t reserved =
-      static_cast<uint64_t>(gc_threshold_ + streams) * cfg.geo.pages_per_block;
+      static_cast<uint64_t>(gc_threshold_ + cfg.gc_soft_extra + streams) * cfg.geo.pages_per_block;
   if (logical_pages_ + reserved > physical) {
     throw std::invalid_argument(
         "over-provisioning too small for " + std::to_string(streams) +
@@ -47,6 +47,7 @@ Ftl::Ftl(const FtlConfig& cfg, std::unique_ptr<VictimPolicy> victim,
         1, static_cast<uint64_t>(static_cast<double>(map_pages) * cfg.map_cache_ratio + 0.5));
     map_ = std::make_unique<MapCache>(per_page, cached);
   }
+  if (cfg.latency.load > 0) lat_ = std::make_unique<LatencyModel>(cfg.latency);
 }
 
 void Ftl::map_access(Lpn lpn, bool dirty) {
@@ -66,6 +67,7 @@ void Ftl::write(Lpn lpn, uint32_t req_pages, uint32_t time_s) {
   if (lpn >= logical_pages_) throw std::out_of_range("write lpn out of range");
   ++now_;
   ++stats_.host_writes;
+  const Stats before = stats_;
   map_access(lpn, true);
 
   Ppn old = l2p_[lpn];
@@ -73,10 +75,17 @@ void Ftl::write(Lpn lpn, uint32_t req_pages, uint32_t time_s) {
   int stream = placement_->host_stream({lpn, now_, prev_time, req_pages, time_s});
   // Invalidate first so GC triggered by this write never copies stale data.
   unmap(lpn);
+  if (cfg_.gc_soft_extra) pace_gc();
 
   uint64_t tag = ++tag_seq_;
   l2p_[lpn] = append(stream, lpn, tag, now_);
   if (cfg_.verify) shadow_[lpn] = tag;
+  if (lat_) {
+    // Everything GC (and the map cache) did inside this write delays it.
+    lat_->on_write(stats_.gc_copies + stats_.wl_copies - before.gc_copies - before.wl_copies,
+                   stats_.erases - before.erases, stats_.map_reads - before.map_reads,
+                   stats_.map_writes - before.map_writes);
+  }
 
   if (cfg_.checkpoint_interval && ++writes_since_cp_ >= cfg_.checkpoint_interval) {
     // Worst case for recovery: power fails just before the next checkpoint.
@@ -108,6 +117,9 @@ Ftl::Rebuild Ftl::rebuild_check() const {
   Rebuild r;
   std::vector<Ppn> l2p = have_cp_ ? cp_ppn_ : std::vector<Ppn>(logical_pages_, kInvalidPpn);
   std::vector<uint64_t> tag = have_cp_ ? cp_tag_ : std::vector<uint64_t>(logical_pages_, 0);
+  // A GC copy keeps its version tag; while the victim isn't erased yet (paced
+  // GC) both copies are on flash, and the one in the later block is live.
+  std::vector<uint64_t> seq(logical_pages_, 0);
   for (BlockId b = 0; b < nand_.num_blocks(); ++b) {
     if (have_cp_ && block_last_prog_[b] <= cp_prog_) continue;  // unchanged since
     if (nand_.block(b).state == BlockState::kFree) continue;
@@ -118,10 +130,12 @@ Ftl::Rebuild Ftl::rebuild_check() const {
       if (nand_.page_state(p) == PageState::kFree) break;  // write pointer
       ++r.pages;
       const Lpn lpn = nand_.page_lpn(p);
-      // >= : a GC copy keeps its version tag, and the copy is the live one.
-      if (l2p[lpn] == kInvalidPpn || nand_.page_tag(p) >= tag[lpn]) {
+      const uint64_t t = nand_.page_tag(p);
+      if (l2p[lpn] == kInvalidPpn || t > tag[lpn] ||
+          (t == tag[lpn] && block_last_prog_[b] >= seq[lpn])) {
         l2p[lpn] = p;
-        tag[lpn] = nand_.page_tag(p);
+        tag[lpn] = t;
+        seq[lpn] = block_last_prog_[b];
       }
     }
   }
@@ -244,6 +258,47 @@ void Ftl::collect_one() {
   ++stats_.gc_count;
 }
 
+void Ftl::pace_gc() {
+  if (pace_victim_ == kInvalidBlock) {
+    if (free_.size() >= gc_threshold_ + cfg_.gc_soft_extra) return;
+    pace_victim_ = victim_->select(nand_, now_);
+    if (pace_victim_ == kInvalidBlock) return;
+    const BlockInfo& v = nand_.block(pace_victim_);
+    placement_->on_victim(v.stream, v.open_time, now_);
+    ++stats_.gc_count;
+    pace_pos_ = 0;
+    // Reclaiming the victim gives (ppb - valid) pages for host writes, so
+    // valid / (ppb - valid) copies per host write keep pace; take twice that.
+    const uint32_t ppb = nand_.ppb(), valid = v.valid;
+    pace_budget_ = valid >= ppb ? ppb : 2 * ((valid + (ppb - valid) - 1) / (ppb - valid)) + 1;
+  }
+  in_gc_ = true;
+  const BlockId victim = pace_victim_;
+  const int victim_stream = nand_.block(victim).stream;
+  const Ppn first = victim * nand_.ppb();
+  uint32_t moved = 0;
+  for (; pace_pos_ < nand_.ppb() && moved < pace_budget_; ++pace_pos_) {
+    const Ppn src = first + pace_pos_;
+    if (nand_.page_state(src) != PageState::kValid) continue;
+    const Lpn lpn = nand_.page_lpn(src);
+    const Time data_time = nand_.page_data_time(src);
+    const int stream = placement_->gc_stream(lpn, now_, data_time, victim_stream);
+    const Ppn dst = append(stream, lpn, nand_.page_tag(src), data_time);
+    nand_.invalidate(src);
+    l2p_[lpn] = dst;
+    map_access(lpn, true);
+    ++moved;
+  }
+  stats_.gc_copies += moved;
+  if (pace_pos_ >= nand_.ppb()) {
+    nand_.erase(victim);
+    free_.push_back(victim);
+    ++stats_.erases;
+    pace_victim_ = kInvalidBlock;
+  }
+  in_gc_ = false;
+}
+
 void Ftl::maybe_static_wear_level() {
   // Cold data pins a block at a low erase count; when the spread exceeds
   // delta, move that data out so the young block re-enters circulation.
@@ -263,6 +318,7 @@ void Ftl::maybe_static_wear_level() {
 }
 
 uint32_t Ftl::relocate_and_erase(BlockId victim, int forced_stream) {
+  if (victim == pace_victim_) pace_victim_ = kInvalidBlock;  // a burst GC finishes it
   const int victim_stream = nand_.block(victim).stream;
   const Ppn first = victim * nand_.ppb();
   uint32_t copies = 0;
@@ -288,7 +344,7 @@ uint32_t Ftl::relocate_and_erase(BlockId victim, int forced_stream) {
 
 double Ftl::effective_alpha() const {
   // Free count oscillates between threshold-1 and threshold.
-  double unusable_blocks = (gc_threshold_ - 0.5) + 0.5 * open_.size();
+  double unusable_blocks = (gc_threshold_ + cfg_.gc_soft_extra - 0.5) + 0.5 * open_.size();
   double usable = static_cast<double>(nand_.geo().physical_pages()) -
                   unusable_blocks * nand_.ppb();
   return usable / logical_pages_;
