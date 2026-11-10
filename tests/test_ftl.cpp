@@ -326,6 +326,22 @@ void test_ml_placement() {
     ftl.check_invariants();
   }
 
+  // Model-driven GC grouping: same invariants, and only for lifetime models.
+  for (const char* gc : {"ell4", "ellrel"}) {
+    FtlConfig cfg = small_config("greedy", "ml", 0.14);
+    auto placement = std::make_unique<MlPlacement>(gbm_path, gc);
+    placement->set_model_gc(true);
+    Ftl ftl(cfg, make_victim_policy("greedy"), std::move(placement));
+    fill_sequential(ftl);
+    ZipfWorkload wl(ftl.logical_pages(), 0.99, 5);
+    run(ftl, wl, 6 * ftl.logical_pages(), {true, 500, 6});
+    for (Lpn l = 0; l < ftl.logical_pages(); ++l) ftl.read(l);
+    ftl.check_invariants();
+  }
+  bool gc_rejects_cls = false;
+  try { MlPlacement(path, "ellcls").set_model_gc(true); } catch (const std::invalid_argument&) { gc_rejects_cls = true; }
+  CHECK(gc_rejects_cls);
+
   // ell trajectory: unknown (-1) until SepBIT collects its first hot block,
   // then a finite value on the feature scale for every later write.
   {

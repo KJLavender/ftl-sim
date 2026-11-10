@@ -144,7 +144,12 @@ std::unique_ptr<Placement> make_placement(const std::string& name,
   }
   if (name == "ml") {
     if (opt.model_path.empty()) throw std::invalid_argument("ml placement needs --model");
-    return std::make_unique<MlPlacement>(opt.model_path, opt.ml_gc, opt.ell_splits);
+    auto ml = std::make_unique<MlPlacement>(opt.model_path, opt.ml_gc, opt.ell_splits);
+    if (opt.ml_gc_rule != "sepbit" && opt.ml_gc_rule != "model") {
+      throw std::invalid_argument("--ml-gc-rule must be sepbit or model");
+    }
+    ml->set_model_gc(opt.ml_gc_rule == "model");
+    return ml;
   }
   throw std::invalid_argument("unknown placement: " + name);
 }

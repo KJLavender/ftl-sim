@@ -34,6 +34,8 @@ ftl
                         (default age)
   --ell-splits=LIST     sepbit-split, ml-gc=ell: host split points in multiples of
                         ell, comma-separated (default 4,16; empty = 2 groups)
+  --ml-gc-rule=NAME     ml ell modes: group GC'd data by SepBIT's age rule (sepbit)
+                        or by the model's predicted remaining lifetime (model)
   --dump-features=PATH  write predictor training rows (features + true class)
   --dump-sample=F       fraction of host writes to dump (default 0.1)
   --dump-erase=PATH     write each block's final erase count, one per line
@@ -132,6 +134,7 @@ void print_json(const FtlConfig& cfg, const Ftl& ftl, const std::string& workloa
     std::printf("  \"model_bytes\": %zu,\n", ml->tree().firmware_bytes());
     std::printf("  \"feature_state_bytes\": %llu,\n",
                 (unsigned long long)ml->features().state_bytes());
+    std::printf("  \"model_gc\": %s,\n", ml->model_gc() ? "true" : "false");
   }
   std::printf("  \"trace_wrapped_requests\": %llu\n", (unsigned long long)wrapped);
   std::printf("}\n");
@@ -176,6 +179,7 @@ int main(int argc, char** argv) {
     const std::string model = a.str("model", "");
     const std::string ml_gc = a.str("ml-gc", "age");
     const std::string ell_splits = a.str("ell-splits", "4,16");
+    const std::string ml_gc_rule = a.str("ml-gc-rule", "sepbit");
     const std::string dump_path = a.str("dump-features", "");
     const double dump_sample = a.num("dump-sample", 0.1);
     const std::string erase_path = a.str("dump-erase", "");
@@ -214,6 +218,7 @@ int main(int argc, char** argv) {
     popt.seed = seed;
     popt.model_path = model;
     popt.ml_gc = ml_gc;
+    popt.ml_gc_rule = ml_gc_rule;
     popt.ell_splits.clear();
     {
       const std::string& list = ell_splits;

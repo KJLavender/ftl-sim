@@ -187,6 +187,20 @@ Three more checks (7% OP, same 5 training and 7 test volumes):
   Classifying the group directly does not help (1.749, same as the control),
   even though its accuracy is higher than SepBIT's rule (0.72 vs 0.68).
 
+Two more ideas that turned out not to be needed:
+
+- **Let the model group GC'd data too** (`bash scripts/ml_gc_model.sh`). Keep the
+  model's predicted lifetime from the host write and, at GC time, group by
+  predicted minus age (falling back to SepBIT's "age" once the prediction has
+  run out). Over 5 seeds: 1.710 vs 1.714 with SepBIT's GC rule, a difference of
+  0.004 ± 0.008 (better on 4 of 7, p = 0.55). For data that survived until GC,
+  its age is already a good enough hint.
+- **Retrain on recent data?** (`bash scripts/ml_retrain.sh`) Split each
+  volume's week into quarters and always test on the last one. Training on Q1
+  only (stale) gives 1.299, Q3 only (recent) 1.309, Q1-Q3 (all) 1.296: about the
+  same, and all beat the 4-group control (1.349) on 6 of 7 volumes. Within this
+  week the servers behave steadily enough that training once is enough.
+
 One fairness fix along the way: the learned modes reported one stream more than
 they used, so GC kept one extra free block for them. With that fixed the tree
 gets 1.714 instead of 1.72, and with only 2 groups it gets 1.79 vs SepBIT's

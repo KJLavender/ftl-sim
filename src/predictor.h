@@ -124,6 +124,15 @@ class MlPlacement : public Placement {
   const DecisionTree& tree() const { return tree_; }
   const FeatureExtractor& features() const { return fx_; }
 
+  // GC side, ell / ell2 / ell4 / ellrel only. SepBIT groups GC'd data by its
+  // age (data that has lived long will live long). With this on, the model's
+  // lifetime prediction from the host write is kept per LPN, and GC groups by
+  // the expected remaining lifetime: predicted - age while the prediction has
+  // not run out, otherwise age (back to SepBIT's assumption). Same 4 GC
+  // streams and thresholds (4 ell, 16 ell). Costs 4 bytes per LPN.
+  void set_model_gc(bool on);
+  bool model_gc() const { return model_gc_; }
+
  private:
   // Maps one of our streams to the SepBIT class it corresponds to.
   int as_sepbit_class(int stream) const;
@@ -144,6 +153,8 @@ class MlPlacement : public Placement {
   // threshold (streams + 2) matches the sepbit control with the same groups.
   int host_streams_ = kLifetimeClasses;
   uint64_t capacity_ = 1;
+  bool model_gc_ = false;
+  std::vector<float> predicted_life_;  // per LPN, host writes (model_gc_ only)
 };
 
 }  // namespace ftl

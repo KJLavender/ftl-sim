@@ -202,6 +202,14 @@ MlPlacement::MlPlacement(const std::string& model_path, const std::string& gc_mo
 void MlPlacement::init(uint64_t logical_pages) {
   capacity_ = std::max<uint64_t>(1, logical_pages);
   fx_.init(logical_pages, tree_.uses_feature(FeatureExtractor::kWallGapFeature));
+  predicted_life_.assign(model_gc_ ? logical_pages : 0, 0.0f);
+}
+
+void MlPlacement::set_model_gc(bool on) {
+  if (on && (!ell_mode_ || ell_target_ == EllTarget::kGroup)) {
+    throw std::invalid_argument("model GC needs ell, ell2, ell4 or ellrel");
+  }
+  model_gc_ = on;
 }
 
 int MlPlacement::host_stream(const HostWrite& w) {
@@ -212,17 +220,22 @@ int MlPlacement::host_stream(const HostWrite& w) {
     const double ell = sepbit_.ell();
     if (ell_target_ != EllTarget::kAbsolute) {
       // Before the first measurement SepBIT treats everything as short-lived.
-      if (ell >= FeatureExtractor::kEllUnknown) return 0;
+      if (ell >= FeatureExtractor::kEllUnknown) {
+        if (model_gc_) predicted_life_[w.lpn] = 0.0f;
+        return 0;
+      }
       if (ell_target_ == EllTarget::kGroup) {
         return std::clamp(tree_.predict(x), 0, host_streams_ - 1);
       }
       // Model output is log2(lifetime / ell).
       const double life = std::exp2(tree_.predict_value(x)) * ell;
+      if (model_gc_) predicted_life_[w.lpn] = static_cast<float>(life);
       return SepBitPlacement::ell_group(life, ell, ell_splits_);
     }
     // Back from log2(1 + 1024 L / C) to host writes, then compare with ell.
     const double v = tree_.predict_value(x);
     const double life = (std::exp2(v) - 1.0) * static_cast<double>(capacity_) / 1024.0;
+    if (model_gc_) predicted_life_[w.lpn] = static_cast<float>(life);
     return SepBitPlacement::ell_group(life, ell, ell_splits_);
   }
   if (hybrid_) {
@@ -245,6 +258,15 @@ int MlPlacement::as_sepbit_class(int stream) const {
 
 int MlPlacement::gc_stream(Lpn lpn, Time now, Time data_time, int victim_stream) {
   if (!sepbit_gc_) return gc_age_stream(now, data_time, capacity_);
+  if (model_gc_ && as_sepbit_class(victim_stream) != 0) {
+    // Same classes as SepBIT's age rule, but with the expected remaining life.
+    const double age = static_cast<double>(now - data_time);
+    const double predicted = predicted_life_[lpn];
+    const double remaining = predicted > age ? predicted - age : age;
+    const double ell = sepbit_.ell();
+    const int cls = remaining < 4 * ell ? 3 : remaining < 16 * ell ? 4 : 5;
+    return host_streams_ + cls - 2;
+  }
   int cls = sepbit_.gc_stream(lpn, now, data_time, as_sepbit_class(victim_stream));
   return host_streams_ + cls - 2;
 }

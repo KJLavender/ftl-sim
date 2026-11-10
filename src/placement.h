@@ -177,6 +177,8 @@ struct PlacementOptions {
   std::string ml_gc = "age";  // ml: age | sepbit
   // sepbit-split and ml --ml-gc=ell: host split points in multiples of ell.
   std::vector<double> ell_splits = {4, 16};
+  // ml ell modes: GC grouping by SepBIT's age rule or the model's prediction.
+  std::string ml_gc_rule = "sepbit";
   uint64_t seed = 1;
 };
 
