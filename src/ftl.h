@@ -6,6 +6,7 @@
 
 #include "config.h"
 #include "gc_policy.h"
+#include "map_cache.h"
 #include "nand.h"
 #include "placement.h"
 
@@ -22,9 +23,16 @@ struct Stats {
   uint64_t wl_count = 0;     // blocks relocated by static wear leveling
   uint64_t erases = 0;
   uint64_t unmapped_reads = 0;
+  uint64_t map_lookups = 0;  // DRAM-less mapping cache (0 when disabled)
+  uint64_t map_reads = 0;    // map pages read from flash (cache misses)
+  uint64_t map_writes = 0;   // dirty map pages written back to flash
 
   double waf() const {
     return host_writes ? static_cast<double>(nand_writes) / host_writes : 0.0;
+  }
+  // Counting map page write-backs as flash writes too.
+  double waf_with_map() const {
+    return host_writes ? static_cast<double>(nand_writes + map_writes) / host_writes : 0.0;
   }
   double avg_valid_per_victim() const {
     return gc_count ? static_cast<double>(gc_copies) / gc_count : 0.0;
@@ -70,6 +78,8 @@ class Ftl {
   // forced_stream >= 0 bypasses the placement policy.
   uint32_t relocate_and_erase(BlockId victim, int forced_stream = -1);
   void unmap(Lpn lpn);
+  // Mapping-table access through the DRAM-less cache (no-op without one).
+  void map_access(Lpn lpn, bool dirty);
 
   FtlConfig cfg_;
   Nand nand_;
@@ -88,6 +98,7 @@ class Ftl {
   uint64_t open_seq_ = 0;
   uint32_t gc_since_wl_check_ = 0;
   int wl_stream_ = -1;  // internal stream for static WL, -1 if disabled
+  std::unique_ptr<MapCache> map_;  // DRAM-less mapping cache, null = all in DRAM
   Stats stats_;
 };
 

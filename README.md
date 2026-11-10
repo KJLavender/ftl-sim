@@ -28,6 +28,7 @@ A longer write-up of the results (in Traditional Chinese): [docs/article.zh-TW.m
 - Page-level mapping, TRIM, three GC policies (`greedy`, `cost-benefit`, `fifo`).
 - Data placement (where each write goes): no separation, write-count rule, [SepBIT](https://www.usenix.org/conference/fast22/presentation/wang) (a published rule-based method used in production at Alibaba), an "oracle" that knows the future (upper bound), NVMe FDP host hints, and a decision-tree predictor.
 - Wear leveling (keeping erase counts even across blocks): dynamic and static.
+- A DRAM-less mode that caches only part of the mapping table and counts the extra map reads and writes.
 - Synthetic workloads (sequential, uniform random, 80/20, Zipf) and real block traces (MSR Cambridge, Alibaba, Tencent).
 - A shadow copy that checks every read returns the latest data, so a bug can't hide behind plausible numbers.
 
@@ -208,6 +209,39 @@ gets 1.714 instead of 1.72, and with only 2 groups it gets 1.79 vs SepBIT's
 
 ![Where the learned placement's gain comes from](docs/figures/ml.png)
 
+### DRAM-less controllers: when the mapping table doesn't fit
+
+Many consumer SSD controllers have no DRAM, so only part of the L2P table
+(4 bytes per page, about 1 GB for a 1 TB drive) fits in on-chip SRAM or in a
+host memory buffer (HMB). The rest lives in flash as map pages. A lookup that
+misses has to read a map page, and a changed map page that gets pushed out has
+to be written back, which is write amplification of its own. `--map-cache=F`
+caches a fraction F of the map pages (LRU); `bash scripts/map_cache.sh` sweeps
+it over the 12 MSR volumes (greedy, 7% OP). "Extra" is map pages written back
+per host write.
+
+| cached part of the map | no separation | SepBIT |
+|---|---|---|
+| 1/1024 (a few MB of SRAM per TB) | 2.63 → 3.23 (+0.60) | 1.88 → 2.33 (+0.45) |
+| 1/256 | +0.46 | +0.33 |
+| 1/64 | +0.31 | +0.20 |
+| 1/16 (a 64 MB HMB per TB) | 2.63 → 2.83 (+0.20) | 1.88 → 1.98 (+0.10) |
+| 1/4 | +0.08 | +0.03 |
+
+- With an SRAM-sized cache the map traffic adds about a quarter to SepBIT's WAF.
+  An HMB-sized cache brings that down to about 5%.
+- Hot/cold separation also halves the map traffic: every page GC moves changes
+  its map entry too, and those entries are scattered. Fewer GC copies means
+  fewer map updates.
+- The hit rate alone is misleading. At 1/1024 SepBIT's hit rate is slightly
+  lower than no separation (0.77 vs 0.78), yet it reads fewer map pages per host
+  write (0.45 vs 0.60), because it does fewer GC copies and so fewer lookups.
+
+Simplifications: map pages are counted as extra flash writes but don't take
+space or get garbage collected themselves; there is no batching of map updates
+(real firmware coalesces them), so these numbers are on the high side; and the
+traces are write-only, so almost every cached map page is dirty.
+
 ### Synthetic workloads
 
 - Zipf writes, 14% OP: SepBIT cuts WAF from 4.62 to 3.55. On uniform random writes no separation helps; extra open blocks just eat spare space.
@@ -228,7 +262,7 @@ gets 1.714 instead of 1.72, and with only 2 groups it gets 1.79 vs SepBIT's
 ## Layout
 
 ```
-src/        simulator (nand, ftl, gc_policy, placement, predictor, workload, sim, main)
+src/        simulator (nand, ftl, gc_policy, placement, predictor, map_cache, workload, sim, main)
 tests/      correctness tests
 tools/      trace converters
 scripts/    experiment grids, ML training and pipelines

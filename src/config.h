@@ -33,6 +33,10 @@ struct FtlConfig {
   uint32_t static_wl_period = 16;
   // Shadow map: verify every read returns the latest written version.
   bool verify = false;
+  // DRAM-less mapping: fraction of the L2P table's map pages (4 bytes per
+  // entry, one flash page each) that fit in the controller's cache.
+  // 0 = the whole table is in DRAM (no map traffic).
+  double map_cache_ratio = 0.0;
 };
 
 }  // namespace ftl

@@ -37,6 +37,24 @@ Ftl::Ftl(const FtlConfig& cfg, std::unique_ptr<VictimPolicy> victim,
   open_.assign(streams, kInvalidBlock);
   for (BlockId b = 0; b < nand_.num_blocks(); ++b) free_.push_back(b);
   placement_->init(logical_pages_);
+
+  if (cfg.map_cache_ratio > 0) {
+    // 4-byte entries, one flash page per map page.
+    const uint32_t per_page = cfg.geo.page_size / 4;
+    const uint64_t map_pages = (logical_pages_ + per_page - 1) / per_page;
+    const uint64_t cached = std::max<uint64_t>(
+        1, static_cast<uint64_t>(static_cast<double>(map_pages) * cfg.map_cache_ratio + 0.5));
+    map_ = std::make_unique<MapCache>(per_page, cached);
+  }
+}
+
+void Ftl::map_access(Lpn lpn, bool dirty) {
+  if (!map_) return;
+  const uint64_t reads = map_->misses(), writes = map_->writebacks();
+  map_->access(lpn, dirty);
+  ++stats_.map_lookups;
+  stats_.map_reads += map_->misses() - reads;
+  stats_.map_writes += map_->writebacks() - writes;
 }
 
 uint64_t Ftl::logical_pages_for(const FtlConfig& cfg) {
@@ -47,6 +65,7 @@ void Ftl::write(Lpn lpn, uint32_t req_pages, uint32_t time_s) {
   if (lpn >= logical_pages_) throw std::out_of_range("write lpn out of range");
   ++now_;
   ++stats_.host_writes;
+  map_access(lpn, true);
 
   Ppn old = l2p_[lpn];
   Time prev_time = old == kInvalidPpn ? kNever : nand_.page_data_time(old);
@@ -62,6 +81,7 @@ void Ftl::write(Lpn lpn, uint32_t req_pages, uint32_t time_s) {
 void Ftl::read(Lpn lpn) {
   if (lpn >= logical_pages_) throw std::out_of_range("read lpn out of range");
   ++stats_.host_reads;
+  map_access(lpn, false);
   Ppn ppn = l2p_[lpn];
   if (ppn == kInvalidPpn) ++stats_.unmapped_reads;
   if (!cfg_.verify) return;
@@ -80,6 +100,7 @@ void Ftl::read(Lpn lpn) {
 void Ftl::trim(Lpn lpn) {
   if (lpn >= logical_pages_) throw std::out_of_range("trim lpn out of range");
   ++stats_.host_trims;
+  map_access(lpn, true);
   unmap(lpn);
   if (cfg_.verify) shadow_[lpn] = 0;
 }
@@ -190,6 +211,7 @@ uint32_t Ftl::relocate_and_erase(BlockId victim, int forced_stream) {
     Ppn dst = append(stream, lpn, nand_.page_tag(src), data_time);
     nand_.invalidate(src);
     l2p_[lpn] = dst;
+    map_access(lpn, true);  // the moved page's entry changes too
     ++copies;
   }
   nand_.erase(victim);

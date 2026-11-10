@@ -20,6 +20,7 @@ ftlsim 是我從零用 C++ 寫的小型 FTL。餵給它一串硬碟寫入紀錄�
 - page 層級的位址對應、TRIM、三種 GC 策略（`greedy`、`cost-benefit`、`fifo`）。
 - 資料擺放方式（每筆寫入要放到哪裡）：不分冷熱、依寫入次數、[SepBIT](https://www.usenix.org/conference/fast22/presentation/wang)（已發表、在阿里雲實際上線的規則式方法）、知道未來的「oracle」（理論上限）、NVMe FDP 主機提示，以及決策樹預測器。
 - Wear leveling（讓每個 block 的抹除次數平均）：動態與靜態兩種。
+- DRAM-less 模式：對應表只快取一部分，計算多出來的對應表讀寫。
 - 合成 workload（循序、均勻隨機、80/20、Zipf）和真實的 block trace（MSR Cambridge、Alibaba、Tencent）。
 - 影子對照表：每次讀取都檢查讀到的是不是最新的資料，避免程式有 bug 但數字看起來合理。
 
@@ -142,6 +143,24 @@ oracle 在每個 volume 都接近 1.0，表示在真實資料上，只要知道�
 
 ![模型的進步從哪裡來](docs/figures/ml.png)
 
+### 沒有 DRAM 的控制器：對應表放不下怎麼辦
+
+很多消費級 SSD 控制器沒有 DRAM，L2P 對應表（每個 page 4 bytes，1 TB 的碟大約 1 GB）只有一小部分放得進晶片上的 SRAM，或借用主機記憶體的 HMB。其他部分以 map page 的形式存在 flash 上。查表沒命中就要先從 flash 讀 map page；被改過的 map page 被擠出去時要寫回 flash，這本身就是另一種寫入放大。`--map-cache=F` 讓控制器快取 F 比例的 map page（LRU），`bash scripts/map_cache.sh` 在 12 個 MSR volume 上掃過不同大小（greedy、OP 7%）。「多出」是每次 host 寫入平均要多寫回幾個 map page。
+
+| 快取對應表的比例 | 不分冷熱 | SepBIT |
+|---|---|---|
+| 1/1024（每 TB 幾 MB 的 SRAM） | 2.63 → 3.23（+0.60） | 1.88 → 2.33（+0.45） |
+| 1/256 | +0.46 | +0.33 |
+| 1/64 | +0.31 | +0.20 |
+| 1/16（每 TB 64 MB 的 HMB） | 2.63 → 2.83（+0.20） | 1.88 → 1.98（+0.10） |
+| 1/4 | +0.08 | +0.03 |
+
+- 快取只有 SRAM 那麼小時，對應表的寫入讓 SepBIT 的 WAF 多了大約四分之一；有 HMB 那麼大時，只多 5% 左右。
+- 冷熱分離也讓對應表的寫入少一半：GC 每搬一個 page，它的對應也要更新，而這些 page 散在各處。GC 搬得少，要更新的 map page 就少。
+- 只看命中率會誤判。快取 1/1024 時，SepBIT 的命中率反而比不分冷熱低一點（0.77 對 0.78），但每次 host 寫入要讀的 map page 比較少（0.45 對 0.60），因為 GC 搬得少，查表的次數本來就少。
+
+簡化的地方：map page 只算成多寫的量，沒有真的佔空間、也不會被 GC；沒有把多次更新合併再寫回（真正的韌體會這樣做），所以這些數字偏高；trace 只有寫入，所以快取裡的 map page 幾乎都被改過。
+
 ### 合成 workload
 
 - Zipf 寫入、OP 14%：SepBIT 把 WAF 從 4.62 降到 3.55。均勻隨機寫入下怎麼分都沒用，多開的寫入點只會吃掉備用空間。
@@ -162,7 +181,7 @@ oracle 在每個 volume 都接近 1.0，表示在真實資料上，只要知道�
 ## 目錄結構
 
 ```
-src/        模擬器（nand、ftl、gc_policy、placement、predictor、workload、sim、main）
+src/        模擬器（nand、ftl、gc_policy、placement、predictor、map_cache、workload、sim、main）
 tests/      正確性測試
 tools/      trace 轉換工具
 scripts/    實驗矩陣、ML 訓練與流程

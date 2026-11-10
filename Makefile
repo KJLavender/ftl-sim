@@ -3,7 +3,7 @@ CXXFLAGS ?= -std=c++17 -O2 -Wall -Wextra -Wpedantic
 BUILD    := build
 
 LIB_SRCS := src/nand.cpp src/gc_policy.cpp src/placement.cpp src/ftl.cpp \
-            src/workload.cpp src/sim.cpp src/predictor.cpp
+            src/workload.cpp src/sim.cpp src/predictor.cpp src/map_cache.cpp
 LIB_OBJS := $(LIB_SRCS:src/%.cpp=$(BUILD)/%.o)
 
 .PHONY: all test clean

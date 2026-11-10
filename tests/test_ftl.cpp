@@ -381,6 +381,51 @@ void test_replay_matches_run() {
   CHECK(a.stats().host_writes == b.stats().host_writes);
 }
 
+// DRAM-less mapping cache: LRU behaviour, and it must not change data WAF.
+void test_map_cache() {
+  // 4 entries per map page, room for 2 map pages.
+  MapCache c(4, 2);
+  c.access(0, true);   // page 0: miss
+  c.access(1, false);  // page 0: hit
+  c.access(4, false);  // page 1: miss
+  c.access(8, false);  // page 2: miss, evicts page 0 (dirty) -> write-back
+  c.access(5, false);  // page 1: hit
+  c.access(12, true);  // page 3: miss, evicts page 2 (clean)
+  CHECK(c.lookups() == 6);
+  CHECK(c.misses() == 4);
+  CHECK(c.writebacks() == 1);
+
+  // Same writes with and without the cache: identical data-side behaviour.
+  FtlConfig base = small_config("greedy", "sepbit", 0.14);
+  base.verify = false;
+  FtlConfig cached = base;
+  cached.map_cache_ratio = 0.05;
+  Ftl a(base), b(cached);
+  const uint64_t n = a.logical_pages();
+  ZipfWorkload wa(n, 0.9, 11), wb(n, 0.9, 11);
+  fill_sequential(a);
+  fill_sequential(b);
+  run(a, wa, 4 * n);
+  run(b, wb, 4 * n);
+  CHECK(a.stats().nand_writes == b.stats().nand_writes);
+  CHECK(a.stats().map_lookups == 0 && b.stats().map_lookups > 0);
+  CHECK(b.stats().map_reads > 0 && b.stats().map_writes > 0);
+  CHECK(b.stats().waf_with_map() > b.stats().waf());
+
+  // Sequential overwrite with a tiny cache: one miss per map page touched,
+  // so about one map read per page_size/4 host writes.
+  FtlConfig seq = base;
+  seq.placement = "none";
+  seq.map_cache_ratio = 1e-9;  // rounds up to a single cached map page
+  Ftl s(seq);
+  const uint64_t m = s.logical_pages();
+  fill_sequential(s);
+  s.reset_stats();
+  fill_sequential(s);
+  const uint64_t per_page = seq.geo.page_size / 4;
+  CHECK(s.stats().map_reads <= m / per_page + 2);
+}
+
 }  // namespace
 
 int main() {
@@ -398,6 +443,7 @@ int main() {
       {"replay == streaming run", test_replay_matches_run},
       {"oracle and FDP hints", test_oracle_and_hints},
       {"decision tree + ml placement", test_ml_placement},
+      {"DRAM-less map cache", test_map_cache},
   };
   for (auto& t : tests) {
     int before = g_failed;

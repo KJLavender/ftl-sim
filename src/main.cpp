@@ -46,6 +46,8 @@ ftl
   --wear-aware          dynamic wear leveling on block allocation
   --static-wl=N         static wear leveling, max erase-count spread (0 = off)
   --static-wl-period=N  check every N GC victims (default 16)
+  --map-cache=F         DRAM-less: cache this fraction of the L2P map pages
+                        (4-byte entries, LRU); 0 = whole table in DRAM (default)
 workload
   --workload=NAME       seq | uniform | hotcold | zipf (default uniform)
   --trace=PATH          unified CSV trace instead of a synthetic workload
@@ -120,6 +122,17 @@ void print_json(const FtlConfig& cfg, const Ftl& ftl, const std::string& workloa
   std::printf("  \"static_wl\": %u,\n", cfg.static_wl_delta);
   std::printf("  \"avg_valid_per_victim\": %.3f,\n", s.avg_valid_per_victim());
   std::printf("  \"waf\": %.5f,\n", s.waf());
+  if (cfg.map_cache_ratio > 0) {
+    const double hw = s.host_writes ? static_cast<double>(s.host_writes) : 1.0;
+    std::printf("  \"map_cache\": %.6f,\n", cfg.map_cache_ratio);
+    std::printf("  \"map_lookups\": %llu,\n", (unsigned long long)s.map_lookups);
+    std::printf("  \"map_reads\": %llu,\n", (unsigned long long)s.map_reads);
+    std::printf("  \"map_writes\": %llu,\n", (unsigned long long)s.map_writes);
+    std::printf("  \"map_hit_rate\": %.5f,\n",
+                s.map_lookups ? 1.0 - static_cast<double>(s.map_reads) / s.map_lookups : 0.0);
+    std::printf("  \"map_reads_per_host_write\": %.5f,\n", s.map_reads / hw);
+    std::printf("  \"waf_with_map\": %.5f,\n", s.waf_with_map());
+  }
   std::printf("  \"fifo_uniform_model_waf\": %.5f,\n", fifo_uniform_waf(alpha));
   std::printf("  \"fifo_uniform_model_waf_effective\": %.5f,\n",
               fifo_uniform_waf(ftl.effective_alpha()));
@@ -157,6 +170,10 @@ int main(int argc, char** argv) {
     cfg.static_wl_delta = static_cast<uint32_t>(a.num("static-wl", 0));
     cfg.static_wl_period = static_cast<uint32_t>(a.num("static-wl-period", 16));
     cfg.verify = a.num("verify", 0) != 0;
+    cfg.map_cache_ratio = a.num("map-cache", 0);
+    if (cfg.map_cache_ratio < 0 || cfg.map_cache_ratio > 1) {
+      throw std::invalid_argument("--map-cache must be between 0 and 1");
+    }
 
     const std::string workload = a.str("workload", "uniform");
     const std::string trace = a.str("trace", "");
