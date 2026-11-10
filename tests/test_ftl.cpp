@@ -426,6 +426,45 @@ void test_map_cache() {
   CHECK(s.stats().map_reads <= m / per_page + 2);
 }
 
+// Power-loss recovery from OOB (+ checkpoints) must give back the live table.
+void test_power_loss_rebuild() {
+  FtlConfig cfg = small_config("greedy", "sepbit", 0.14);
+  cfg.verify = false;
+  {
+    Ftl ftl(cfg);
+    const uint64_t n = ftl.logical_pages();
+    fill_sequential(ftl);
+    ZipfWorkload wl(n, 0.9, 13);
+    run(ftl, wl, 3 * n);
+    const Ftl::Rebuild r = ftl.rebuild_check();  // no checkpoint: full scan
+    CHECK(r.mismatches == 0 && r.resurrected == 0);
+    CHECK(r.pages == ftl.programmed_pages());
+  }
+  {
+    FtlConfig c = cfg;
+    c.checkpoint_interval = Ftl::logical_pages_for(c) / 8;
+    Ftl ftl(c);
+    const uint64_t n = ftl.logical_pages();
+    fill_sequential(ftl);
+    ZipfWorkload wl(n, 0.9, 13);
+    run(ftl, wl, 3 * n);
+    CHECK(ftl.stats().rebuilds > 10);
+    CHECK(ftl.stats().rebuild_mismatches == 0);
+    CHECK(ftl.rebuild_check().mismatches == 0);
+    // A checkpoint means scanning only what was written since.
+    CHECK(ftl.stats().rebuild_pages_max < ftl.programmed_pages() / 2);
+  }
+  {
+    // TRIMs are not logged: trimmed data still on flash comes back.
+    Ftl ftl(cfg);
+    fill_sequential(ftl);
+    for (Lpn l = 0; l < 100; ++l) ftl.trim(l);
+    const Ftl::Rebuild r = ftl.rebuild_check();
+    CHECK(r.mismatches == 0);
+    CHECK(r.resurrected == 100);
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -444,6 +483,7 @@ int main() {
       {"oracle and FDP hints", test_oracle_and_hints},
       {"decision tree + ml placement", test_ml_placement},
       {"DRAM-less map cache", test_map_cache},
+      {"power-loss L2P rebuild", test_power_loss_rebuild},
   };
   for (auto& t : tests) {
     int before = g_failed;

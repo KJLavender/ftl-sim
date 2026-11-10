@@ -37,6 +37,11 @@ struct FtlConfig {
   // entry, one flash page each) that fit in the controller's cache.
   // 0 = the whole table is in DRAM (no map traffic).
   double map_cache_ratio = 0.0;
+  // Power-loss recovery: save the L2P table every this many host writes
+  // (0 = never). Before each save the FTL simulates a crash, rebuilds the
+  // table from the checkpoint plus the OOB of blocks written since, and
+  // checks it against the live table.
+  uint64_t checkpoint_interval = 0;
 };
 
 }  // namespace ftl

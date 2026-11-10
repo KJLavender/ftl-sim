@@ -37,6 +37,7 @@ Ftl::Ftl(const FtlConfig& cfg, std::unique_ptr<VictimPolicy> victim,
   open_.assign(streams, kInvalidBlock);
   for (BlockId b = 0; b < nand_.num_blocks(); ++b) free_.push_back(b);
   placement_->init(logical_pages_);
+  block_last_prog_.assign(nand_.num_blocks(), 0);
 
   if (cfg.map_cache_ratio > 0) {
     // 4-byte entries, one flash page per map page.
@@ -76,6 +77,70 @@ void Ftl::write(Lpn lpn, uint32_t req_pages, uint32_t time_s) {
   uint64_t tag = ++tag_seq_;
   l2p_[lpn] = append(stream, lpn, tag, now_);
   if (cfg_.verify) shadow_[lpn] = tag;
+
+  if (cfg_.checkpoint_interval && ++writes_since_cp_ >= cfg_.checkpoint_interval) {
+    // Worst case for recovery: power fails just before the next checkpoint.
+    const Rebuild r = rebuild_check();
+    ++stats_.rebuilds;
+    stats_.rebuild_pages += r.pages;
+    stats_.rebuild_pages_max = std::max(stats_.rebuild_pages_max, r.pages);
+    stats_.rebuild_mismatches += r.mismatches;
+    checkpoint();
+    writes_since_cp_ = 0;
+  }
+}
+
+void Ftl::checkpoint() {
+  cp_ppn_ = l2p_;
+  cp_tag_.assign(logical_pages_, 0);
+  for (Lpn l = 0; l < logical_pages_; ++l) {
+    if (l2p_[l] != kInvalidPpn) cp_tag_[l] = nand_.page_tag(l2p_[l]);
+  }
+  cp_prog_ = prog_seq_;
+  have_cp_ = true;
+  ++stats_.checkpoints;
+  // The whole table: 4-byte entries, page_size / 4 per map page.
+  const uint64_t per_page = cfg_.geo.page_size / 4;
+  stats_.checkpoint_writes += (logical_pages_ + per_page - 1) / per_page;
+}
+
+Ftl::Rebuild Ftl::rebuild_check() const {
+  Rebuild r;
+  std::vector<Ppn> l2p = have_cp_ ? cp_ppn_ : std::vector<Ppn>(logical_pages_, kInvalidPpn);
+  std::vector<uint64_t> tag = have_cp_ ? cp_tag_ : std::vector<uint64_t>(logical_pages_, 0);
+  for (BlockId b = 0; b < nand_.num_blocks(); ++b) {
+    if (have_cp_ && block_last_prog_[b] <= cp_prog_) continue;  // unchanged since
+    if (nand_.block(b).state == BlockState::kFree) continue;
+    ++r.blocks;
+    const Ppn first = static_cast<Ppn>(b) * nand_.ppb();
+    for (uint32_t i = 0; i < nand_.ppb(); ++i) {
+      const Ppn p = first + i;
+      if (nand_.page_state(p) == PageState::kFree) break;  // write pointer
+      ++r.pages;
+      const Lpn lpn = nand_.page_lpn(p);
+      // >= : a GC copy keeps its version tag, and the copy is the live one.
+      if (l2p[lpn] == kInvalidPpn || nand_.page_tag(p) >= tag[lpn]) {
+        l2p[lpn] = p;
+        tag[lpn] = nand_.page_tag(p);
+      }
+    }
+  }
+  for (Lpn l = 0; l < logical_pages_; ++l) {
+    if (l2p[l] == l2p_[l]) continue;
+    if (l2p_[l] == kInvalidPpn) {
+      ++r.resurrected;
+    } else {
+      ++r.mismatches;
+    }
+  }
+  return r;
+}
+
+uint64_t Ftl::programmed_pages() const {
+  uint64_t n = 0;
+  const uint64_t total = static_cast<uint64_t>(nand_.num_blocks()) * nand_.ppb();
+  for (uint64_t p = 0; p < total; ++p) n += nand_.page_state(static_cast<Ppn>(p)) != PageState::kFree;
+  return n;
 }
 
 void Ftl::read(Lpn lpn) {
@@ -127,6 +192,7 @@ Ppn Ftl::append(int stream, Lpn lpn, uint64_t tag, Time data_time) {
   }
   ++stats_.nand_writes;
   Ppn ppn = nand_.program(b, lpn, tag, data_time);
+  block_last_prog_[b] = ++prog_seq_;
   if (nand_.block(b).state == BlockState::kClosed) b = kInvalidBlock;
   return ppn;
 }

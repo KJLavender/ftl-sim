@@ -29,6 +29,8 @@ A longer write-up of the results (in Traditional Chinese): [docs/article.zh-TW.m
 - Data placement (where each write goes): no separation, write-count rule, [SepBIT](https://www.usenix.org/conference/fast22/presentation/wang) (a published rule-based method used in production at Alibaba), an "oracle" that knows the future (upper bound), NVMe FDP host hints, and a decision-tree predictor.
 - Wear leveling (keeping erase counts even across blocks): dynamic and static.
 - A DRAM-less mode that caches only part of the mapping table and counts the extra map reads and writes.
+- Power-loss recovery: rebuilds the mapping table from checkpoints plus the
+  per-page spare area (OOB), and checks the result against the real table.
 - Synthetic workloads (sequential, uniform random, 80/20, Zipf) and real block traces (MSR Cambridge, Alibaba, Tencent).
 - A shadow copy that checks every read returns the latest data, so a bug can't hide behind plausible numbers.
 
@@ -241,6 +243,46 @@ Simplifications: map pages are counted as extra flash writes but don't take
 space or get garbage collected themselves; there is no batching of map updates
 (real firmware coalesces them), so these numbers are on the high side; and the
 traces are write-only, so almost every cached map page is dirty.
+
+### Power loss: rebuilding the mapping table
+
+The L2P table lives in RAM, so after a sudden power loss the drive has to
+rebuild it. Each flash page carries a small spare area (OOB) where the FTL
+writes the page's LPN and a version number; the newest version of each LPN
+wins. Reading the OOB of every page works but is slow, so firmware saves the
+table to flash now and then (a checkpoint) and after a crash only scans blocks
+written since the last one. `--checkpoint=F` saves the table every F × capacity
+host writes. Just before each save the simulator pretends the power went out,
+rebuilds the table from the last checkpoint plus the OOB scan, and compares it
+entry by entry with the real table. `bash scripts/rebuild.sh` runs this on the
+12 MSR volumes (greedy, 7% OP). "Scan" is the share of all physical pages read
+during a rebuild.
+
+| checkpoint every | map writes per host write | scan, no separation | scan, SepBIT |
+|---|---|---|---|
+| 1/16 capacity | 0.016 | 5.8% | 4.2% |
+| 1/4 capacity | 0.004 | 11.5% | 9.0% |
+| 1 capacity | 0.001 | 19.1% | 16.3% |
+| 4 capacities | 0.0003 | 27.2% | 25.0% |
+| never | 0 | 99.9% | 99.6% |
+
+- All rebuilt tables matched the real ones exactly (96 runs, about 6,000
+  simulated crashes, 0 wrong entries).
+- The trade-off is plain: checkpointing 4× more often costs 4× more map writes,
+  and the scan shrinks by less than that. The checkpoint cost is about
+  1 / (1024 × F) per host write, since one 4 KiB map page holds 1024 entries.
+- Even with a rare checkpoint the scan stays far below a full scan, because
+  blocks full of cold data are never rewritten and can be skipped. That is
+  another reason to keep cold data apart.
+- SepBIT scans about a quarter less at frequent checkpoints, because it does
+  fewer GC writes between checkpoints.
+- TRIM isn't logged in this model, so a trimmed LPN whose old data is still on
+  flash comes back after a rebuild. The unit test shows it; the MSR traces have
+  no TRIMs, so it doesn't show up here. Real firmware logs TRIMs for this.
+
+Simplifications: the crash is always placed just before a checkpoint (the worst
+moment); checkpoint writes are counted but not added to WAF; scan cost is
+counted in pages read, with no timing.
 
 ### Synthetic workloads
 

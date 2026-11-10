@@ -26,6 +26,12 @@ struct Stats {
   uint64_t map_lookups = 0;  // DRAM-less mapping cache (0 when disabled)
   uint64_t map_reads = 0;    // map pages read from flash (cache misses)
   uint64_t map_writes = 0;   // dirty map pages written back to flash
+  uint64_t checkpoints = 0;        // L2P snapshots saved
+  uint64_t checkpoint_writes = 0;  // map pages written by those snapshots
+  uint64_t rebuilds = 0;           // simulated crashes (one before each checkpoint)
+  uint64_t rebuild_pages = 0;      // OOB pages read, summed over rebuilds
+  uint64_t rebuild_pages_max = 0;
+  uint64_t rebuild_mismatches = 0; // rebuilt entries that differ from the live table
 
   double waf() const {
     return host_writes ? static_cast<double>(nand_writes) / host_writes : 0.0;
@@ -68,6 +74,22 @@ class Ftl {
   // Full consistency check of L2P vs. OOB and per-block counters. Throws.
   void check_invariants() const;
 
+  // Power-loss recovery. A rebuild starts from the last checkpoint (or from
+  // nothing) and scans the OOB of every block programmed since, keeping the
+  // highest version tag per LPN. TRIMs are not logged, so a trimmed LPN whose
+  // old data is still on flash comes back ("resurrected").
+  struct Rebuild {
+    uint64_t blocks = 0;       // blocks scanned
+    uint64_t pages = 0;        // OOB pages read
+    uint64_t mismatches = 0;   // entries pointing at the wrong data
+    uint64_t resurrected = 0;  // trimmed LPNs that came back
+  };
+  Rebuild rebuild_check() const;
+  void checkpoint();
+  // Pages holding data (valid or stale): what a rebuild without any
+  // checkpoint has to read.
+  uint64_t programmed_pages() const;
+
  private:
   Ppn append(int stream, Lpn lpn, uint64_t tag, Time data_time);
   BlockId allocate_block(bool most_worn = false);
@@ -99,6 +121,14 @@ class Ftl {
   uint32_t gc_since_wl_check_ = 0;
   int wl_stream_ = -1;  // internal stream for static WL, -1 if disabled
   std::unique_ptr<MapCache> map_;  // DRAM-less mapping cache, null = all in DRAM
+  // Recovery bookkeeping: program counter, last program per block, snapshot.
+  uint64_t prog_seq_ = 0;
+  std::vector<uint64_t> block_last_prog_;
+  bool have_cp_ = false;
+  uint64_t cp_prog_ = 0;
+  std::vector<Ppn> cp_ppn_;
+  std::vector<uint64_t> cp_tag_;
+  uint64_t writes_since_cp_ = 0;
   Stats stats_;
 };
 

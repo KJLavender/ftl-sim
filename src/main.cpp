@@ -48,6 +48,9 @@ ftl
   --static-wl-period=N  check every N GC victims (default 16)
   --map-cache=F         DRAM-less: cache this fraction of the L2P map pages
                         (4-byte entries, LRU); 0 = whole table in DRAM (default)
+  --checkpoint=F        power-loss recovery: save the L2P table every F x capacity
+                        host writes; before each save, simulate a crash, rebuild
+                        from checkpoint + OOB scan and check it (0 = off)
 workload
   --workload=NAME       seq | uniform | hotcold | zipf (default uniform)
   --trace=PATH          unified CSV trace instead of a synthetic workload
@@ -133,6 +136,26 @@ void print_json(const FtlConfig& cfg, const Ftl& ftl, const std::string& workloa
     std::printf("  \"map_reads_per_host_write\": %.5f,\n", s.map_reads / hw);
     std::printf("  \"waf_with_map\": %.5f,\n", s.waf_with_map());
   }
+  if (cfg.checkpoint_interval > 0) {
+    const double hw = s.host_writes ? static_cast<double>(s.host_writes) : 1.0;
+    const double phys = static_cast<double>(cfg.geo.physical_pages());
+    const Ftl::Rebuild end = ftl.rebuild_check();  // one more crash at the very end
+    std::printf("  \"checkpoint_interval\": %llu,\n",
+                (unsigned long long)cfg.checkpoint_interval);
+    std::printf("  \"checkpoints\": %llu,\n", (unsigned long long)s.checkpoints);
+    std::printf("  \"checkpoint_writes_per_host_write\": %.5f,\n", s.checkpoint_writes / hw);
+    std::printf("  \"rebuilds\": %llu,\n", (unsigned long long)s.rebuilds);
+    std::printf("  \"rebuild_pages_avg\": %.1f,\n",
+                s.rebuilds ? static_cast<double>(s.rebuild_pages) / s.rebuilds : 0.0);
+    std::printf("  \"rebuild_pages_max\": %llu,\n", (unsigned long long)s.rebuild_pages_max);
+    std::printf("  \"rebuild_scan_frac_avg\": %.5f,\n",
+                s.rebuilds ? static_cast<double>(s.rebuild_pages) / s.rebuilds / phys : 0.0);
+    std::printf("  \"rebuild_mismatches\": %llu,\n",
+                (unsigned long long)(s.rebuild_mismatches + end.mismatches));
+    std::printf("  \"rebuild_resurrected_at_end\": %llu,\n", (unsigned long long)end.resurrected);
+    std::printf("  \"full_scan_frac\": %.5f,\n",
+                static_cast<double>(ftl.programmed_pages()) / phys);
+  }
   std::printf("  \"fifo_uniform_model_waf\": %.5f,\n", fifo_uniform_waf(alpha));
   std::printf("  \"fifo_uniform_model_waf_effective\": %.5f,\n",
               fifo_uniform_waf(ftl.effective_alpha()));
@@ -174,6 +197,8 @@ int main(int argc, char** argv) {
     if (cfg.map_cache_ratio < 0 || cfg.map_cache_ratio > 1) {
       throw std::invalid_argument("--map-cache must be between 0 and 1");
     }
+    const double checkpoint_frac = a.num("checkpoint", 0);
+    if (checkpoint_frac < 0) throw std::invalid_argument("--checkpoint must be >= 0");
 
     const std::string workload = a.str("workload", "uniform");
     const std::string trace = a.str("trace", "");
@@ -216,6 +241,10 @@ int main(int argc, char** argv) {
     if (!a.m.empty()) throw std::invalid_argument("unknown option --" + a.m.begin()->first);
 
     const uint64_t n = Ftl::logical_pages_for(cfg);
+    if (checkpoint_frac > 0) {
+      cfg.checkpoint_interval =
+          std::max<uint64_t>(1, static_cast<uint64_t>(checkpoint_frac * static_cast<double>(n)));
+    }
     Recording rec;
     std::string label = workload;
     if (!trace.empty()) {
