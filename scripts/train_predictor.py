@@ -14,6 +14,10 @@ Targets:
   regress   predict the expected log lifetime, then bucket it into a class.
             For memoryless data this groups pages by hotness instead of
             chasing the noisy realized class.
+  ellrel    regress log2(lifetime / ell), where ell is SepBIT's threshold at
+            the time of the write (the ell_log column); for --ml-gc=ellrel
+  ellgroup  classify the host group directly (lifetime vs ell at the
+            --ell-splits points); for --ml-gc=ellcls
 
 Models:
   tree  one decision tree (default, what a controller could afford)
@@ -51,6 +55,21 @@ BASE_FEATURES = ["prev_lifetime", "first_write", "write_count",
 
 def to_class(log_lifetime):
     return np.searchsorted(BOUNDS, log_lifetime, side="right")
+
+
+def log_ratio(lifetime_log, ell_log):
+    """log2(lifetime / ell) from two values on the log2(1 + 1024 L / C) scale."""
+    life = np.exp2(lifetime_log) - 1.0
+    ell = np.exp2(ell_log) - 1.0
+    return np.log2(np.maximum(life, 1e-9) / np.maximum(ell, 1e-9))
+
+
+def ell_group(ratio_log, splits):
+    """Host group: 0 below ell, then one more per split point passed (as in C++)."""
+    g = (ratio_log >= 0).astype(int)
+    for s in splits:
+        g += (ratio_log >= np.log2(s)).astype(int)
+    return g
 
 
 def load(paths):
@@ -164,7 +183,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("csv", help="training CSV(s), comma-separated")
     ap.add_argument("-o", "--output", required=True)
-    ap.add_argument("--target", choices=["classify", "regress"], default="regress")
+    ap.add_argument("--target", choices=["classify", "regress", "ellrel", "ellgroup"],
+                    default="regress")
     ap.add_argument("--model", choices=["tree", "gbm"], default="tree")
     ap.add_argument("--max-depth", type=int, default=6)
     ap.add_argument("--min-leaf", type=int, default=200)
@@ -179,6 +199,8 @@ def main():
     ap.add_argument("--raw", action="store_true",
                     help="tree, regress: export the predicted lifetime instead of a "
                          "class (needed for --ml-gc=ell2/ell4)")
+    ap.add_argument("--ell-splits", default="4,16",
+                    help="ellrel / ellgroup: host group split points in multiples of ell")
     ap.add_argument("--train-frac", type=float, default=1.0,
                     help="train on this random fraction of the training rows")
     ap.add_argument("--seed", type=int, default=0)
@@ -189,16 +211,19 @@ def main():
     split = [float(v) for v in a.split.split(",")] if a.split else []
     if len(split) > NUM_CLASSES - 1:
         ap.error("--split allows at most 4 boundaries")
-    if a.model == "gbm" and (a.target != "regress" or split):
-        ap.error("--model gbm supports only --target regress without --split")
-    if (a.quantile or a.raw) and a.target != "regress":
-        ap.error("--quantile and --raw need --target regress")
+    ell_target = a.target in ("ellrel", "ellgroup")
+    if a.model == "gbm" and (a.target not in ("regress", "ellrel") or split):
+        ap.error("--model gbm supports only --target regress / ellrel without --split")
+    if (a.quantile or a.raw) and a.target not in ("regress", "ellrel"):
+        ap.error("--quantile and --raw need --target regress or ellrel")
+    if a.target == "ellrel":
+        a.raw = True  # the C++ side reads the predicted log ratio from the leaves
     if a.raw and split:
         ap.error("--raw exports a lifetime, --split does not apply")
 
     all_feats, df = load(a.csv)
     if a.features == "base":
-        names = BASE_FEATURES
+        names = BASE_FEATURES + (["ell_log"] if ell_target else [])
     elif a.features == "all":
         names = all_feats
     else:
@@ -212,9 +237,21 @@ def main():
         tr, te = train_test_split(df, test_size=0.2, random_state=a.seed)
     if a.train_frac < 1.0:
         tr = tr.sample(frac=a.train_frac, random_state=a.seed)
+    if ell_target:
+        if "ell_log" not in all_feats:
+            raise SystemExit("this CSV has no ell_log column; re-dump with the current ftlsim")
+        # Rows before SepBIT has measured ell have no target relative to it.
+        tr, te = tr[tr["ell_log"] >= 0], te[te["ell_log"] >= 0]
     Xtr, Xte = tr[names].to_numpy(), te[names].to_numpy()
     ytr, yte = tr["label"].to_numpy().astype(int), te["label"].to_numpy().astype(int)
     ltr, lte = tr["lifetime_log"].to_numpy(), te["lifetime_log"].to_numpy()
+    ell_splits = [float(v) for v in a.ell_splits.split(",") if v]
+    if ell_target:
+        # Targets relative to SepBIT's ell: log2(lifetime / ell) and the host group.
+        ltr, lte = log_ratio(ltr, tr["ell_log"].to_numpy()), log_ratio(lte, te["ell_log"].to_numpy())
+        ytr, yte = ell_group(ltr, ell_splits), ell_group(lte, ell_splits)
+    if a.target == "ellgroup":
+        a.target = "classify"   # same tree, the class is the group
 
     if a.model == "gbm":
         loss = {"loss": "quantile", "quantile": a.quantile} if a.quantile else {}
@@ -230,7 +267,7 @@ def main():
             raise SystemExit(f"exported ensemble disagrees with sklearn (max diff {diff})")
         nodes = export_gbm(model, a.output, cols, len(all_feats))
         size = f"{len(trees)} trees, {nodes} nodes, ~{nodes * 13} bytes packed"
-        pred = to_class(raw)
+        pred = ell_group(raw, ell_splits) if ell_target else to_class(raw)
     elif a.target == "classify":
         model = DecisionTreeClassifier(max_depth=a.max_depth, min_samples_leaf=a.min_leaf,
                                        random_state=a.seed).fit(Xtr, ytr)
@@ -245,7 +282,7 @@ def main():
         else:
             leaf_values = model.tree_.value[:, 0, 0].copy()
         raw = leaf_values[model.apply(Xte)]
-        pred = to_class(raw)
+        pred = ell_group(raw, ell_splits) if ell_target else to_class(raw)
     if a.model == "tree" and a.raw:
         export_raw_tree(model, leaf_values, a.output, cols, len(all_feats))
     if a.model == "tree":
@@ -256,10 +293,18 @@ def main():
 
     acc = (pred == yte).mean()
     majority = (yte == np.bincount(ytr).argmax()).mean()
-    rule = (prev_lifetime_rule(te["prev_lifetime"].to_numpy()) == yte).mean()
+    if ell_target:
+        # SepBIT's own rule: the previous lifetime relative to ell.
+        prev = te["prev_lifetime"].to_numpy()
+        rule_pred = ell_group(log_ratio(np.maximum(prev, 0), te["ell_log"].to_numpy()), ell_splits)
+        rule_pred[prev < 0] = len(ell_splits) + 1  # first write: last group
+        rule = (rule_pred == yte).mean()
+    else:
+        rule = (prev_lifetime_rule(te["prev_lifetime"].to_numpy()) == yte).mean()
+    k = max(NUM_CLASSES, len(ell_splits) + 2)
     print(f"train rows {len(tr)}  test rows {len(te)}  features {','.join(names)}")
-    print(f"test class mix {np.bincount(yte, minlength=NUM_CLASSES).tolist()}")
-    print(f"predicted mix {np.bincount(pred, minlength=NUM_CLASSES).tolist()}")
+    print(f"test class mix {np.bincount(yte, minlength=k).tolist()}")
+    print(f"predicted mix {np.bincount(pred, minlength=k).tolist()}")
     print(f"accuracy: model {acc:.3f}  prev-lifetime rule {rule:.3f}  majority {majority:.3f}")
     if raw is not None:
         print(f"log-lifetime R^2: model {r2(lte, raw):.3f}")

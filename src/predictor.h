@@ -17,10 +17,13 @@ namespace ftl {
 // hour of day, position on the drive, and wall-clock time since the page was
 // last written. The last one needs 4 more bytes per LPN, so it is only
 // tracked when asked for.
+// Feature 9 is SepBIT's current ell (same log scale, -1 before it is known),
+// set by the caller, so a model can predict lifetime relative to ell.
 class FeatureExtractor {
  public:
-  static constexpr int kNumFeatures = 9;
+  static constexpr int kNumFeatures = 10;
   static constexpr int kWallGapFeature = 8;
+  static constexpr int kEllFeature = 9;
   static constexpr int kRegionShift = 8;  // 256 pages = 1 MiB per region
   using Features = std::array<float, kNumFeatures>;
   static const char* feature_name(int i);
@@ -31,6 +34,11 @@ class FeatureExtractor {
   void update(const HostWrite& w);
   // Firmware memory needed for the feature state.
   uint64_t state_bytes() const;
+  // Current SepBIT ell in host writes; values >= 1e299 mean not measured yet.
+  void set_ell(double ell);
+  // log2(1 + 1024 * lifetime / capacity): 0 = instant, 10 = one capacity.
+  static float norm_log(double lifetime, uint64_t capacity);
+  static constexpr double kEllUnknown = 1e299;
 
  private:
   float norm_log_lifetime(Time lifetime) const;
@@ -42,6 +50,7 @@ class FeatureExtractor {
   std::vector<uint16_t> region_heat_; // decayed writes per region
   std::vector<uint32_t> last_time_s_; // wall clock of the last write (optional)
   Time next_decay_ = 0;
+  float ell_log_ = -1.0f;
 };
 
 // Model exported by scripts/train_predictor.py. Two text formats:
@@ -92,15 +101,21 @@ class DecisionTree {
 //   "ell2":   SepBIT with the predicted lifetime in place of the previous
 //             one: predicted < ell -> stream 0, else stream 1. SepBIT GC.
 //   "ell4":   same, but the rest is split at 4 ell and 16 ell (streams 1..3).
-//             Both need a model that outputs a lifetime (ftl-gbm format).
+//   "ell":    same, split at the given multiples of ell.
+//             These need a model that outputs a lifetime (ftl-gbm format).
+//   "ellrel": the model predicts log2(lifetime / ell) directly, with the
+//             current ell as a feature; grouped at the given splits.
+//   "ellcls": the model is a class tree whose class is the host group.
 class MlPlacement : public Placement {
  public:
-  MlPlacement(const std::string& model_path, const std::string& gc_mode);
+  // ell_splits is used by gc_mode "ell" (ell2 / ell4 fix it to {} / {4, 16}).
+  MlPlacement(const std::string& model_path, const std::string& gc_mode,
+              std::vector<double> ell_splits = {4, 16});
   std::string name() const override {
-    if (ell_groups_) return ell_groups_ == 2 ? "ml-ell2" : "ml-ell4";
+    if (ell_mode_) return "ml-" + ell_name_;
     return hybrid_ ? "ml-hybrid" : sepbit_gc_ ? "ml-sepbitgc" : "ml";
   }
-  int num_streams() const override { return kLifetimeClasses + (sepbit_gc_ ? 4 : 3); }
+  int num_streams() const override { return host_streams_ + (sepbit_gc_ ? 4 : 3); }
   void init(uint64_t logical_pages) override;
   int host_stream(const HostWrite& w) override;
   int gc_stream(Lpn lpn, Time now, Time data_time, int victim_stream) override;
@@ -118,7 +133,16 @@ class MlPlacement : public Placement {
   SepBitPlacement sepbit_;
   bool sepbit_gc_;
   bool hybrid_ = false;  // SepBIT host test first, tree splits the rest
-  int ell_groups_ = 0;   // 2 or 4: compare the predicted lifetime with ell
+  bool ell_mode_ = false;  // compare the predicted lifetime with ell
+  // What the model outputs in the ell modes: lifetime on the capacity scale
+  // (ell, ell2, ell4), log2(lifetime / ell) (ellrel), or the group (ellcls).
+  enum class EllTarget { kAbsolute, kRelative, kGroup };
+  EllTarget ell_target_ = EllTarget::kAbsolute;
+  std::string ell_name_;
+  std::vector<double> ell_splits_;
+  // Host streams in use. Exact in the ell modes, so the GC free-block
+  // threshold (streams + 2) matches the sepbit control with the same groups.
+  int host_streams_ = kLifetimeClasses;
   uint64_t capacity_ = 1;
 };
 

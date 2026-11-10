@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <stdexcept>
 
+#include "gc_policy.h"
 #include "predictor.h"
 
 namespace ftl {
@@ -123,7 +124,7 @@ void replay(Ftl& ftl, const Recording& rec, const RunOptions& opt) {
 
 uint64_t dump_features(const Recording& rec, const DeathTimes& death,
                        uint64_t logical_pages, const std::string& path,
-                       double sample, uint64_t seed) {
+                       double sample, uint64_t seed, const std::vector<float>* ell_log) {
   std::FILE* f = std::fopen(path.c_str(), "w");
   if (!f) throw std::runtime_error("cannot write " + path);
   for (int i = 0; i < FeatureExtractor::kNumFeatures; ++i) {
@@ -144,6 +145,7 @@ uint64_t dump_features(const Recording& rec, const DeathTimes& death,
     if (op.op != Op::kWrite) continue;
     HostWrite w{op.lpn, ++t, last[op.lpn], op.req_pages, op.time_s};
     auto x = fx.extract(w);
+    if (ell_log) x[FeatureExtractor::kEllFeature] = (*ell_log)[t];
     fx.update(w);
     last[op.lpn] = t;
     if (coin(rng) >= sample) continue;
@@ -160,6 +162,45 @@ uint64_t dump_features(const Recording& rec, const DeathTimes& death,
   }
   std::fclose(f);
   return rows;
+}
+
+namespace {
+// SepBIT that writes down ell each time a host write asks for a stream.
+class EllRecorder : public Placement {
+ public:
+  EllRecorder(std::vector<float>* out, uint64_t capacity) : out_(out), capacity_(capacity) {}
+  std::string name() const override { return "sepbit"; }
+  int num_streams() const override { return sepbit_.num_streams(); }
+  int host_stream(const HostWrite& w) override {
+    const double ell = sepbit_.ell();
+    (*out_)[w.now] = ell >= FeatureExtractor::kEllUnknown
+                         ? -1.0f
+                         : FeatureExtractor::norm_log(ell, capacity_);
+    return sepbit_.host_stream(w);
+  }
+  int gc_stream(Lpn lpn, Time now, Time data_time, int victim_stream) override {
+    return sepbit_.gc_stream(lpn, now, data_time, victim_stream);
+  }
+  void on_victim(int victim_stream, Time open_time, Time now) override {
+    sepbit_.on_victim(victim_stream, open_time, now);
+  }
+
+ private:
+  SepBitPlacement sepbit_;
+  std::vector<float>* out_;
+  uint64_t capacity_;
+};
+}  // namespace
+
+std::vector<float> ell_trajectory(const FtlConfig& cfg, const Recording& rec,
+                                  uint64_t logical_pages) {
+  std::vector<float> out(rec.writes + 2, -1.0f);
+  FtlConfig c = cfg;
+  c.verify = false;
+  Ftl ftl(c, make_victim_policy(c.gc_policy),
+          std::make_unique<EllRecorder>(&out, logical_pages));
+  replay(ftl, rec);
+  return out;
 }
 
 EraseSummary erase_summary(const Nand& nand) {

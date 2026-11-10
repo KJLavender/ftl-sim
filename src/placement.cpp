@@ -21,13 +21,24 @@ int WriteCountPlacement::host_stream(const HostWrite& w) {
   return count_[w.lpn] >= threshold_ ? 0 : 1;
 }
 
+std::string SepBitPlacement::name() const {
+  if (splits_.empty()) return "sepbit";
+  if (splits_ == std::vector<double>{4, 16}) return "sepbit4";
+  return "sepbit-split";
+}
+
+int SepBitPlacement::ell_group(double lifetime, double ell, const std::vector<double>& splits) {
+  if (lifetime < ell) return 0;
+  int g = 1;
+  for (double s : splits) {
+    if (lifetime >= s * ell) ++g;
+  }
+  return g;
+}
+
 int SepBitPlacement::host_stream(const HostWrite& w) {
-  const int last = host_groups_ - 1;
-  if (w.prev_write_time == kNever) return last;  // first write: no lifespan known
-  double lifespan = static_cast<double>(w.now - w.prev_write_time);
-  if (lifespan < ell_) return 0;
-  if (host_groups_ == 2) return 1;
-  return lifespan < 4 * ell_ ? 1 : lifespan < 16 * ell_ ? 2 : 3;
+  if (w.prev_write_time == kNever) return host_groups_ - 1;  // no lifespan known
+  return ell_group(static_cast<double>(w.now - w.prev_write_time), ell_, splits_);
 }
 
 int SepBitPlacement::gc_stream(Lpn, Time now, Time data_time, int victim_stream) {
@@ -124,7 +135,8 @@ std::unique_ptr<Placement> make_placement(const std::string& name,
   if (name == "sepgc") return std::make_unique<SepGcPlacement>();
   if (name == "wcount") return std::make_unique<WriteCountPlacement>();
   if (name == "sepbit") return std::make_unique<SepBitPlacement>();
-  if (name == "sepbit4") return std::make_unique<SepBitPlacement>(4);
+  if (name == "sepbit4") return std::make_unique<SepBitPlacement>(std::vector<double>{4, 16});
+  if (name == "sepbit-split") return std::make_unique<SepBitPlacement>(opt.ell_splits);
   if (name == "oracle") return std::make_unique<OraclePlacement>(opt.death, opt.logical_pages);
   if (name == "fdp") {
     return std::make_unique<FdpPlacement>(opt.death, opt.logical_pages, opt.hint_noise,
@@ -132,7 +144,7 @@ std::unique_ptr<Placement> make_placement(const std::string& name,
   }
   if (name == "ml") {
     if (opt.model_path.empty()) throw std::invalid_argument("ml placement needs --model");
-    return std::make_unique<MlPlacement>(opt.model_path, opt.ml_gc);
+    return std::make_unique<MlPlacement>(opt.model_path, opt.ml_gc, opt.ell_splits);
   }
   throw std::invalid_argument("unknown placement: " + name);
 }

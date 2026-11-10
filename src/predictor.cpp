@@ -12,8 +12,17 @@ const char* FeatureExtractor::feature_name(int i) {
   static const char* names[kNumFeatures] = {
       "prev_lifetime", "first_write", "write_count",
       "prev2_lifetime", "region_heat", "req_pages_log2",
-      "hour", "lba_frac", "prev_gap_s_log2"};
+      "hour", "lba_frac", "prev_gap_s_log2", "ell_log"};
   return names[i];
+}
+
+float FeatureExtractor::norm_log(double lifetime, uint64_t capacity) {
+  const double x = 1024.0 * lifetime / static_cast<double>(std::max<uint64_t>(1, capacity));
+  return static_cast<float>(std::log2(1.0 + x));
+}
+
+void FeatureExtractor::set_ell(double ell) {
+  ell_log_ = ell >= kEllUnknown ? -1.0f : norm_log(ell, capacity_);
 }
 
 void FeatureExtractor::init(uint64_t logical_pages, bool track_wall_time) {
@@ -25,10 +34,8 @@ void FeatureExtractor::init(uint64_t logical_pages, bool track_wall_time) {
   next_decay_ = capacity_;
 }
 
-// log2(1 + 1024 * lifetime / capacity): 0 = instant, 10 = one capacity.
 float FeatureExtractor::norm_log_lifetime(Time lifetime) const {
-  double x = 1024.0 * static_cast<double>(lifetime) / static_cast<double>(capacity_);
-  return static_cast<float>(std::log2(1.0 + x));
+  return norm_log(static_cast<double>(lifetime), capacity_);
 }
 
 FeatureExtractor::Features FeatureExtractor::extract(const HostWrite& w) const {
@@ -46,6 +53,7 @@ FeatureExtractor::Features FeatureExtractor::extract(const HostWrite& w) const {
   if (!first && !last_time_s_.empty() && w.time_s >= last_time_s_[w.lpn]) {
     f[8] = static_cast<float>(std::log2(1.0 + (w.time_s - last_time_s_[w.lpn])));
   }
+  f[9] = ell_log_;
   return f;
 }
 
@@ -160,16 +168,33 @@ bool DecisionTree::uses_feature(int f) const {
   return false;
 }
 
-MlPlacement::MlPlacement(const std::string& model_path, const std::string& gc_mode) {
+MlPlacement::MlPlacement(const std::string& model_path, const std::string& gc_mode,
+                         std::vector<double> ell_splits) {
   if (gc_mode != "age" && gc_mode != "sepbit" && gc_mode != "hybrid" &&
-      gc_mode != "ell2" && gc_mode != "ell4") {
-    throw std::invalid_argument("ml gc mode must be age, sepbit, hybrid, ell2 or ell4");
+      gc_mode != "ell2" && gc_mode != "ell4" && gc_mode != "ell" &&
+      gc_mode != "ellrel" && gc_mode != "ellcls") {
+    throw std::invalid_argument(
+        "ml gc mode must be age, sepbit, hybrid, ell2, ell4, ell, ellrel or ellcls");
   }
+  ell_target_ = gc_mode == "ellrel" ? EllTarget::kRelative
+              : gc_mode == "ellcls" ? EllTarget::kGroup
+                                    : EllTarget::kAbsolute;
   hybrid_ = gc_mode == "hybrid";
-  ell_groups_ = gc_mode == "ell2" ? 2 : gc_mode == "ell4" ? 4 : 0;
+  ell_mode_ = gc_mode.rfind("ell", 0) == 0;
+  if (ell_mode_) {
+    ell_name_ = gc_mode;
+    ell_splits_ = gc_mode == "ell2" ? std::vector<double>{}
+                : gc_mode == "ell4" ? std::vector<double>{4, 16}
+                                    : std::move(ell_splits);
+    host_streams_ = 2 + static_cast<int>(ell_splits_.size());
+  }
   sepbit_gc_ = gc_mode != "age";
   tree_.load(model_path);
-  if (ell_groups_ && !tree_.regression()) {
+  if (ell_target_ == EllTarget::kGroup) {
+    if (tree_.regression()) {
+      throw std::invalid_argument("ellcls needs a class tree (train with --target ellgroup)");
+    }
+  } else if (ell_mode_ && !tree_.regression()) {
     throw std::invalid_argument("ell modes need a lifetime model (train with --raw or gbm)");
   }
 }
@@ -180,16 +205,25 @@ void MlPlacement::init(uint64_t logical_pages) {
 }
 
 int MlPlacement::host_stream(const HostWrite& w) {
+  fx_.set_ell(sepbit_.ell());
   FeatureExtractor::Features x = fx_.extract(w);
   fx_.update(w);
-  if (ell_groups_) {
+  if (ell_mode_) {
+    const double ell = sepbit_.ell();
+    if (ell_target_ != EllTarget::kAbsolute) {
+      // Before the first measurement SepBIT treats everything as short-lived.
+      if (ell >= FeatureExtractor::kEllUnknown) return 0;
+      if (ell_target_ == EllTarget::kGroup) {
+        return std::clamp(tree_.predict(x), 0, host_streams_ - 1);
+      }
+      // Model output is log2(lifetime / ell).
+      const double life = std::exp2(tree_.predict_value(x)) * ell;
+      return SepBitPlacement::ell_group(life, ell, ell_splits_);
+    }
     // Back from log2(1 + 1024 L / C) to host writes, then compare with ell.
     const double v = tree_.predict_value(x);
     const double life = (std::exp2(v) - 1.0) * static_cast<double>(capacity_) / 1024.0;
-    const double ell = sepbit_.ell();
-    if (life < ell) return 0;
-    if (ell_groups_ == 2) return 1;
-    return life < 4 * ell ? 1 : life < 16 * ell ? 2 : 3;
+    return SepBitPlacement::ell_group(life, ell, ell_splits_);
   }
   if (hybrid_) {
     // SepBIT's own test first: a short previous lifetime goes to stream 0.
@@ -205,14 +239,14 @@ int MlPlacement::host_stream(const HostWrite& w) {
 }
 
 int MlPlacement::as_sepbit_class(int stream) const {
-  if (stream < kLifetimeClasses) return stream == 0 ? 0 : 1;  // host classes
-  return stream - kLifetimeClasses + 2;                       // GC classes 2..5
+  if (stream < host_streams_) return stream == 0 ? 0 : 1;  // host classes
+  return stream - host_streams_ + 2;                       // GC classes 2..5
 }
 
 int MlPlacement::gc_stream(Lpn lpn, Time now, Time data_time, int victim_stream) {
   if (!sepbit_gc_) return gc_age_stream(now, data_time, capacity_);
   int cls = sepbit_.gc_stream(lpn, now, data_time, as_sepbit_class(victim_stream));
-  return kLifetimeClasses + cls - 2;
+  return host_streams_ + cls - 2;
 }
 
 void MlPlacement::on_victim(int victim_stream, Time open_time, Time now) {

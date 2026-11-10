@@ -24,12 +24,16 @@ device
   --op=F                over-provisioning, (phys-user)/user (default 0.07)
 ftl
   --gc=NAME             greedy | cost-benefit | fifo (default greedy)
-  --placement=NAME      none | sepgc | wcount | sepbit | sepbit4 | oracle | fdp | ml
-                        (default none; sepbit4 = SepBIT with 4 host groups)
+  --placement=NAME      none | sepgc | wcount | sepbit | sepbit4 | sepbit-split |
+                        oracle | fdp | ml (default none; sepbit4 = SepBIT with 4 host
+                        groups, sepbit-split = host groups split at --ell-splits)
   --model=PATH          ml: decision tree or boosted ensemble from scripts/train_predictor.py
   --ml-gc=NAME          ml: age | sepbit (GC regrouping) | hybrid (SepBIT host test,
-                        tree splits the rest, SepBIT GC) | ell2 | ell4 (predicted
-                        lifetime vs SepBIT's ell, 2 or 4 host groups) (default age)
+                        tree splits the rest, SepBIT GC) | ell2 | ell4 | ell (predicted
+                        lifetime vs SepBIT's ell; 2, 4 or --ell-splits host groups)
+                        (default age)
+  --ell-splits=LIST     sepbit-split, ml-gc=ell: host split points in multiples of
+                        ell, comma-separated (default 4,16; empty = 2 groups)
   --dump-features=PATH  write predictor training rows (features + true class)
   --dump-sample=F       fraction of host writes to dump (default 0.1)
   --dump-erase=PATH     write each block's final erase count, one per line
@@ -171,6 +175,7 @@ int main(int argc, char** argv) {
     }
     const std::string model = a.str("model", "");
     const std::string ml_gc = a.str("ml-gc", "age");
+    const std::string ell_splits = a.str("ell-splits", "4,16");
     const std::string dump_path = a.str("dump-features", "");
     const double dump_sample = a.num("dump-sample", 0.1);
     const std::string erase_path = a.str("dump-erase", "");
@@ -209,11 +214,29 @@ int main(int argc, char** argv) {
     popt.seed = seed;
     popt.model_path = model;
     popt.ml_gc = ml_gc;
+    popt.ell_splits.clear();
+    {
+      const std::string& list = ell_splits;
+      size_t pos = 0;
+      while (pos < list.size()) {
+        size_t end = list.find(',', pos);
+        if (end == std::string::npos) end = list.size();
+        if (end > pos) popt.ell_splits.push_back(std::stod(list.substr(pos, end - pos)));
+        pos = end + 1;
+      }
+      for (size_t i = 0; i < popt.ell_splits.size(); ++i) {
+        if (popt.ell_splits[i] <= 1 || (i && popt.ell_splits[i] <= popt.ell_splits[i - 1])) {
+          throw std::invalid_argument("--ell-splits must be increasing and > 1");
+        }
+      }
+    }
     if (placement_needs_future(cfg.placement) || !dump_path.empty()) {
       popt.death = std::make_shared<const DeathTimes>(death_times(rec, n));
     }
     if (!dump_path.empty()) {
-      uint64_t rows = dump_features(rec, *popt.death, n, dump_path, dump_sample, seed);
+      // One extra SepBIT pass to know ell at every write (for the ell feature).
+      const std::vector<float> ell = ell_trajectory(cfg, rec, n);
+      uint64_t rows = dump_features(rec, *popt.death, n, dump_path, dump_sample, seed, &ell);
       std::fprintf(stderr, "dumped %llu rows to %s\n", (unsigned long long)rows,
                    dump_path.c_str());
     }

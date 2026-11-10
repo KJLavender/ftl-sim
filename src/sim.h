@@ -57,9 +57,17 @@ void replay(Ftl& ftl, const Recording& rec, const RunOptions& opt = {});
 // Writes one CSV row per sampled host write: the online features, the true
 // lifetime class (label) and whether the write is in the measured phase.
 // Returns rows written.
+// ell_log (optional, from ell_trajectory) fills the ell feature and adds an
+// ell_log column, so the trainer can learn lifetime relative to ell.
 uint64_t dump_features(const Recording& rec, const DeathTimes& death,
                        uint64_t logical_pages, const std::string& path,
-                       double sample, uint64_t seed);
+                       double sample, uint64_t seed,
+                       const std::vector<float>* ell_log = nullptr);
+
+// Replays rec under SepBIT and records its ell (FeatureExtractor log scale,
+// -1 while unknown) at every host write time t, as seen by that write.
+std::vector<float> ell_trajectory(const FtlConfig& cfg, const Recording& rec,
+                                  uint64_t logical_pages);
 
 struct EraseSummary {
   uint32_t min = 0, max = 0;

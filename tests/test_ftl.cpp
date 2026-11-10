@@ -51,7 +51,7 @@ void test_sequential_waf_is_one() {
 
 void test_random_with_shadow_all_configs() {
   for (const char* gc : {"greedy", "cost-benefit", "fifo"}) {
-    for (const char* pl : {"none", "sepgc", "wcount", "sepbit", "sepbit4"}) {
+    for (const char* pl : {"none", "sepgc", "wcount", "sepbit", "sepbit4", "sepbit-split"}) {
       for (bool wear : {false, true}) {
         FtlConfig cfg = small_config(gc, pl, 0.14);
         cfg.wear_aware_alloc = wear;
@@ -291,16 +291,57 @@ void test_ml_placement() {
   }
   CHECK(rejected);
 
-  for (const char* gc : {"age", "sepbit", "hybrid", "ell2", "ell4"}) {
+  // Host groups by lifetime relative to ell: <ell, then one per split passed.
+  const std::vector<double> splits = {4, 16};
+  CHECK(SepBitPlacement::ell_group(5, 10, splits) == 0);
+  CHECK(SepBitPlacement::ell_group(10, 10, splits) == 1);
+  CHECK(SepBitPlacement::ell_group(40, 10, splits) == 2);
+  CHECK(SepBitPlacement::ell_group(1000, 10, splits) == 3);
+  CHECK(SepBitPlacement::ell_group(1000, 10, {}) == 1);
+  // The learned ell modes use exactly as many streams as the rule control, so
+  // both reserve the same number of free blocks for GC.
+  CHECK(MlPlacement(gbm_path, "ell4").num_streams() ==
+        SepBitPlacement(std::vector<double>{4, 16}).num_streams());
+  CHECK(MlPlacement(gbm_path, "ell2").num_streams() == SepBitPlacement().num_streams());
+  CHECK(MlPlacement(gbm_path, "ell", {2, 8, 32, 128}).num_streams() ==
+        SepBitPlacement(std::vector<double>{2, 8, 32, 128}).num_streams());
+
+  // ellcls needs a class tree, ellrel a lifetime (regression) model.
+  bool cls_rejects_gbm = false, rel_rejects_tree = false;
+  try { MlPlacement p(gbm_path, "ellcls"); } catch (const std::invalid_argument&) { cls_rejects_gbm = true; }
+  try { MlPlacement p(path, "ellrel"); } catch (const std::invalid_argument&) { rel_rejects_tree = true; }
+  CHECK(cls_rejects_gbm && rel_rejects_tree);
+
+  for (const char* gc : {"age", "sepbit", "hybrid", "ell2", "ell4", "ell", "ellrel", "ellcls"}) {
     FtlConfig cfg = small_config("greedy", "ml", 0.14);
-    const bool ell = std::string(gc).rfind("ell", 0) == 0;
-    auto placement = std::make_unique<MlPlacement>(ell ? gbm_path : path, gc);
+    const std::string mode = gc;
+    const bool lifetime_model = mode.rfind("ell", 0) == 0 && mode != "ellcls";
+    auto placement = std::make_unique<MlPlacement>(lifetime_model ? gbm_path : path, gc,
+                                                   std::vector<double>{2, 8, 32, 128});
     Ftl ftl(cfg, make_victim_policy("greedy"), std::move(placement));
     fill_sequential(ftl);
     ZipfWorkload wl(ftl.logical_pages(), 0.99, 4);
     run(ftl, wl, 6 * ftl.logical_pages(), {true, 500, 6});
     for (Lpn l = 0; l < ftl.logical_pages(); ++l) ftl.read(l);
     ftl.check_invariants();
+  }
+
+  // ell trajectory: unknown (-1) until SepBIT collects its first hot block,
+  // then a finite value on the feature scale for every later write.
+  {
+    FtlConfig cfg = small_config("greedy", "sepbit", 0.14);
+    const uint64_t n = Ftl::logical_pages_for(cfg);
+    ZipfWorkload wl(n, 0.99, 7);
+    Recording rec = record_synthetic(wl, n, true, 2 * n, 2 * n);
+    std::vector<float> ell = ell_trajectory(cfg, rec, n);
+    CHECK(ell.size() >= rec.writes + 1);
+    CHECK(ell[1] < 0);              // first write: nothing collected yet
+    CHECK(ell[rec.writes] > 0);     // by the end ell is known
+    size_t first_known = 1;
+    while (first_known <= rec.writes && ell[first_known] < 0) ++first_known;
+    bool stays_known = true;
+    for (size_t t = first_known; t <= rec.writes; ++t) stays_known &= ell[t] >= 0;
+    CHECK(stays_known);
   }
 }
 

@@ -83,22 +83,27 @@ class WriteCountPlacement : public Placement {
 //   ell (avg lifespan of recently collected class-0 blocks), else class 1.
 //   GC writes: from a class-0 victim -> class 2; otherwise by data age:
 //   < 4*ell -> 3, < 16*ell -> 4, else 5.
-// With host_groups = 4 ("sepbit4", a control for the learned ell4 mode) the
-// long-lived host class is split again by previous lifetime at 4 ell and
-// 16 ell; first writes go to the last host group. GC classes shift up by 2.
+// With host_splits (a control for the learned ell modes) the long-lived host
+// class is split again by previous lifetime at each split * ell, e.g. {4, 16}
+// gives 4 host groups ("sepbit4"); first writes go to the last host group.
+// GC classes follow the host groups.
 class SepBitPlacement : public Placement {
  public:
-  explicit SepBitPlacement(int host_groups = 2) : host_groups_(host_groups) {}
-  std::string name() const override { return host_groups_ == 2 ? "sepbit" : "sepbit4"; }
+  explicit SepBitPlacement(std::vector<double> host_splits = {})
+      : splits_(std::move(host_splits)), host_groups_(2 + static_cast<int>(splits_.size())) {}
+  std::string name() const override;
   int num_streams() const override { return host_groups_ + 4; }
   int host_stream(const HostWrite& w) override;
   int gc_stream(Lpn lpn, Time now, Time data_time, int victim_stream) override;
   void on_victim(int victim_stream, Time open_time, Time now) override;
 
   double ell() const { return ell_; }
+  // Host group of a lifetime: 0 below ell, then one group per split passed.
+  static int ell_group(double lifetime, double ell, const std::vector<double>& splits);
 
  private:
   static constexpr size_t kWindow = 16;  // recent class-0 victims to average
+  std::vector<double> splits_;
   int host_groups_;
   double ell_ = 1e300;                   // infinite until first measurement
   std::deque<Time> lifespans_;
@@ -170,6 +175,8 @@ struct PlacementOptions {
   bool fdp_persistent = true;
   std::string model_path;  // required by ml
   std::string ml_gc = "age";  // ml: age | sepbit
+  // sepbit-split and ml --ml-gc=ell: host split points in multiples of ell.
+  std::vector<double> ell_splits = {4, 16};
   uint64_t seed = 1;
 };
 

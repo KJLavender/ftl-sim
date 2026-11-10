@@ -152,11 +152,11 @@ rest at 4 ell and 16 ell into three more groups:
 | SepBIT | 1.81 | |
 | decision tree, fixed boundaries | 2.02 | 1 |
 | SepBIT rule split into 4 groups (control, no model) | 1.75 | 7 |
-| decision tree + ell, 4 groups | 1.72 | 6 |
+| decision tree + ell, 4 groups | 1.72 | 7 |
 
 The same 1.3 KB tree goes from 2.02 to 1.72. But part of that is just having
 more groups: SepBIT's own rule split into the same 4 groups already gets 1.75.
-So roughly 2/3 of the gain comes from more groups and 1/3 from the model.
+So roughly 3/5 of the gain comes from more groups and 2/5 from the model.
 Training the model to be slow to call data hot (quantile loss) only helped with
 fixed boundaries (2.02 → 1.89) and made no difference once ell was used.
 
@@ -166,6 +166,31 @@ Two more checks:
   1.68 and the 4-group control 1.63; it beats the control on 5 of 7 volumes.
 - At 14% OP the model ties the 4-group control (both 1.21, SepBIT 1.23). With
   more spare space the model's edge disappears.
+
+Three more checks (7% OP, same 5 training and 7 test volumes):
+
+- **Does it survive another seed?** (`bash scripts/ml_seeds.sh`) Re-sampling the
+  training rows and retraining with 5 seeds gives 1.714 on average (std 0.007).
+  The gain over the control is 0.037 ± 0.007, and the worst seed still gains
+  0.033. The model beats the control on 6 of 7 volumes (paired t-test p = 0.04).
+  So the gain is real but small, and web_0 carries the most of it (without it
+  the other six gain 0.025 on average).
+- **Do more groups help?** (`bash scripts/ml_splits.sh`) Going from 2 to 3 to 4
+  groups helps; beyond that it stops. The rule gets 1.75 with 4, 6 or 8 groups,
+  and splitting at 2/8, 4/16 or 8/64 times ell makes little difference. At 14%
+  OP, 8 groups are worse than 4 because the extra open blocks eat spare space.
+- **Train the model on the question it answers.** (`bash scripts/ml_ell_target.sh`)
+  The model learned lifetime on a fixed scale but is compared with ell at run
+  time. Giving it the current ell as a feature and training it on
+  lifetime ÷ ell gives 1.694 over 3 seeds, the best so far, but it beats the
+  original model on only 4 of 7 volumes (p = 0.38), so that is not settled.
+  Classifying the group directly does not help (1.749, same as the control),
+  even though its accuracy is higher than SepBIT's rule (0.72 vs 0.68).
+
+One fairness fix along the way: the learned modes reported one stream more than
+they used, so GC kept one extra free block for them. With that fixed the tree
+gets 1.714 instead of 1.72, and with only 2 groups it gets 1.79 vs SepBIT's
+1.81 (better on 3 of 7 volumes), so a small difference.
 
 ![Where the learned placement's gain comes from](docs/figures/ml.png)
 
